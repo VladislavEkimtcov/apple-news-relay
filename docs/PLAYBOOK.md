@@ -46,4 +46,34 @@ everything as soon as it appears (it checks every 5 s) and never deletes.
 
 `tools/explore.py` picks an action every ~3 minutes (refresh with 0–16 pages, open a channel or
 topic, fetch a free or a News+ story, search, or idle) and records what the archive gained.
-Results: see the summary appended below by `python3 tools/explore.py --report <log>`.
+Summarize a log with `python3 tools/explore.py --report <log>`.
+
+First run: 99 actions over 6 hours (2026-11-23, 00:50–07:03), with the relay's archive already
+holding ~2,000 stories, so "+articles" counts only stories it had never seen.
+
+```
+action                    runs       ok  s median +articles  +bodies
+fetch_free                  17     100%       6.1       5.8      1.0
+fetch_paid                   5     100%       6.1       0.0      1.0
+idle                        14     100%      65.0       0.0      0.0
+open_tag                    22     100%      33.5      40.3      1.3
+refresh_today pages=0        8     100%      17.2       6.4      0.0
+refresh_today pages=4        4      75%      53.6      16.2      0.0
+refresh_today pages=8        7      57%      60.1       7.9      0.0
+refresh_today pages=16       6      67%      57.2       3.5      0.0
+search                      16     100%      14.5       1.7      0.4
+```
+
+What it says:
+
+- **Opening a story always works**: 22 of 22 bodies captured, ~6 s, News+ stories included
+  (their bodies are cached even without a subscription; the relay serves only a preview of
+  them).
+- **Opening a channel is the best way to grow the archive**: a median of +25 new stories per
+  channel (up to +120), +12 per Today section, and usually nothing new for a topic.
+- **Refreshing Today with a few pages is enough**: 4 pages found the most new stories; 8 and 16
+  pages found fewer (the feed repeats itself further down) and often ran past the 60 s `wait`
+  (the "ok" misses are jobs still running at 60 s, plus one "Today not found" while News had no
+  window). Clients should poll the job rather than rely on `wait` for big refreshes.
+- **Search adds little**: ~2 new stories, most results were already archived.
+- **Idling adds nothing**: News doesn't refresh in the background while it isn't in front.
