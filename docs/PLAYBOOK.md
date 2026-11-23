@@ -48,8 +48,9 @@ everything as soon as it appears (it checks every 5 s) and never deletes.
 topic, fetch a free or a News+ story, search, or idle) and records what the archive gained.
 Summarize a log with `python3 tools/explore.py --report <log>`.
 
-First run: 99 actions over 6 hours (2026-11-23, 00:50–07:03), with the relay's archive already
-holding ~2,000 stories, so "+articles" counts only stories it had never seen.
+First run: 99 actions over 6 hours (2026-11-23, 00:50–07:03), with the relay's archive growing
+alongside (about 2,000 stories by the end), so "+articles" counts only stories it had never
+seen.
 
 ```
 action                    runs       ok  s median +articles  +bodies
