@@ -107,6 +107,30 @@ class CacheReaderTest(unittest.TestCase):
         self.news.write_feed([{"kindId": "TOP_STORIES:DEFAULT", "items": [A1]}], cursor="ANCIENT", created=NOW - 90 * 3600)
         self.assertEqual(len(nc.read_sections(self.news.paths)), 3, "a feed days old doesn't come back")
 
+    def test_tag_feeds(self):
+        other = "TotherCCCCCCCCCCCCCCCCC"
+        self.news.set_tag_feed(TOPIC, [{"id": A1, "published": NOW - 60, "cluster": "Cstory", "channel": CH,
+                                         "topics": [TOPIC, other]},
+                                        {"id": A2, "published": NOW - 120}])
+        self.news.set_tag_feed(other, [{"id": A2}], variant="")
+        items = list(nc.read_tag_feeds(self.news.paths, [TOPIC]))
+        self.assertEqual([(i.tag_id, i.article_id) for i in items], [(TOPIC, A1), (TOPIC, A2)])
+        a = items[0]
+        self.assertEqual(a.feed_id, TOPIC + "@B$en-US")
+        self.assertAlmostEqual(a.published_at, NOW - 60, places=2)
+        self.assertEqual((a.cluster_id, a.channel_id, a.topic_ids), ("Cstory", CH, [TOPIC, other]))
+        self.assertEqual(len(list(nc.read_tag_feeds(self.news.paths))), 3, "all feeds when no tags are named")
+        states = nc.read_feed_states(self.news.paths)
+        self.assertEqual(set(states), {TOPIC + "@B$en-US", other + "$en-US"})
+        self.assertEqual(nc.feed_tag(other + "#P@A$en-US"), other)
+
+    def test_damaged_feed_item_is_skipped(self):
+        self.news.feeds[TOPIC + "@B$en-US"] = ([{"id": A1}], 5)
+        self.news.write_feeddb(damaged=True)
+        self.assertEqual([i.article_id for i in nc.read_tag_feeds(self.news.paths)], [A1])
+        self.assertIsNone(nc.parse_feed_item(b"\x01\x03abc"))
+        self.assertEqual(list(nc.read_tag_feeds(nc.NewsPaths(container="/nonexistent"), [TOPIC])), [])
+
     def test_entitlement(self):
         self.assertFalse(nc.read_entitlement(self.news.paths).news_plus)
         self.news.write_entitlement(True)

@@ -62,8 +62,11 @@ with AND; lists inside one filter combine with OR:
 | 500 | `internal-error` | a bug: see the relay log |
 
 **Caching.** Every 200 carries a weak `ETag`; send it back in `If-None-Match` to get `304 Not
-Modified`. Complete articles are `Cache-Control: max-age=60`, everything else `no-cache`.
-Responses over 1 KB are gzipped when the client accepts it.
+Modified`. For most routes the tag is a hash of the response, so a 304 saves the transfer but not
+the work; `/v1/front` tags its answer with the front version and answers 304 before building
+anything. Complete articles are `Cache-Control: max-age=60`, everything else `no-cache`.
+Responses over 1 KB are gzipped when the client accepts it. Connections are kept alive (idle ones
+close after 120 s).
 
 **CORS** is open (`Access-Control-Allow-Origin: *`) so a browser dashboard can call the relay.
 
@@ -78,13 +81,15 @@ job):
 - `interactive`: someone is waiting on it: a story opened with `GET /v1/articles/{id}`, a fetch,
   a search.
 - `normal`: refreshes of Today, sections, channels and topics.
-- `background`: prefetching, such as `/v1/saved?fetch_missing=true` or
-  `POST /v1/articles/{id}/fetch?priority=background` (a client guessing what will be opened
-  next). A background fetch steps aside as soon as an interactive job is queued.
+- `background`: prefetching, such as an interest list (below), `/v1/saved?fetch_missing=true` or
+  `POST /v1/articles/{id}/fetch?priority=background`. A background fetch steps aside as soon as
+  an interactive job is queued, and gives up after 8 s (`timed_out: true`; someone opening the
+  story still gets a full try).
 
-Interactive jobs start within 0.25 s of the last News action, the others keep 1.5 s apart. A
-fetch looks for the body every 0.15 s for its first 4 s: a story News already has opens in
-about half a second.
+Interactive jobs start within 0.25 s of the last News action, background story fetches 0.6 s
+after it (`--warm-gap`), refreshes and channel opens 1.5 s. A fetch looks for the body every
+0.15 s for its first 4 s: a story News already has opens in about half a second. An
+`open_tag` steps aside for a story someone opens once it has run 3 s.
 
 - `POST` endpoints that start a job answer `202 Accepted` with the job and a `Location` header
   (`/v1/jobs/{id}`), or `200` with the finished job if it completed within `wait`.
@@ -103,6 +108,44 @@ curl 'localhost:8787/v1/articles/A1b2C3…?wait=15'
 
 If the job is still running when `wait` runs out, the article comes back with
 `completeness: "summary"`, a `fetch_job` member and `Retry-After`.
+
+### Interest: fetching ahead of the reader
+
+A client that knows where the reader is heading (the card in focus, its neighbours, the next
+story) sends the stories it may open, most likely first, at most 12:
+
+```sh
+curl -X PUT localhost:8787/v1/interest/tv-1a2b3c -d '{"articles": ["A…", "A…", "A…"]}'
+```
+
+```json
+{"data": {"client": "tv-1a2b3c", "articles": [{"id": "A…", "state": "cached"},
+          {"id": "A…", "state": "queued"}, {"id": "A…", "state": "failed_recently"}]}}
+```
+
+The relay has News fetch the ones it has no body for, in that order, as background jobs. A newer
+list from the same client replaces the older one: fetches it no longer names (and no other client
+wants) are cancelled, or stopped at once if running (`result: {"superseded": true}`); the ones
+still named move to their new place. A story someone opens meanwhile is never dropped. These jobs
+aren't recorded or announced until they start. `DELETE /v1/interest/{client}` forgets the list
+(when the app goes to the background). The client id is the client's own choice, 3–40 letters,
+digits, `-` or `_`. `GET /v1/status` counts the warming jobs (`jobs.warming`).
+
+Every fetch opens the story in News, so it also lands in News's reading history on the Mac.
+
+### Partial bodies
+
+`max_chars=N` returns only the story's opening: about N characters of text, at most 3 pictures
+and 25 blocks, a caption kept with its picture. `body.next_block` says where the rest starts
+(null when the story ends there); fetch it with `from_block`:
+
+```sh
+curl 'localhost:8787/v1/articles/A1b2C3…?wait=14&max_chars=2400'   # one trip; ~2 screens
+curl 'localhost:8787/v1/articles/A1b2C3…?fetch=never&from_block=6'
+```
+
+`body.block_count` and `body.word_count` always describe the whole story. Bodies are converted
+once and kept in memory (300 of them).
 
 | job | started by | typical time |
 |---|---|---|
@@ -163,8 +206,33 @@ id: 17
 data: {"count": 37, "ids": ["A…", …], "seq": 17, "at": "2026-11-23T07:01:12Z"}
 ```
 
-Events: `articles.added`, `article.body_captured`, `sections.updated`, `saved.updated`,
-`handoff.updated`, `job.updated`. A comment line every 15 s keeps proxies from closing the connection.
+Events: `hello`, `front.updated`, `articles.added`, `article.body_captured`, `sections.updated`,
+`saved.updated`, `handoff.updated`, `job.updated`. A comment line every 15 s keeps proxies from
+closing the connection.
+
+- `hello` comes first on every connection: `{"version", "front_version", "features"}`. A client
+  that reconnects compares `front_version` with the page it shows.
+- `front.updated {version}`: something a front page shows changed (a section's stories, Latest,
+  Saved). Captured bodies don't count; they come as `article.body_captured {id}`.
+- `sections.updated` is sent only when a section really changed, not on every write News makes.
+
+## The front page in one call
+
+`GET /v1/front` returns what a reader's front page needs:
+
+```json
+{"data": {"version": 1795470655186,
+  "sections": [{"id": "topic-tech", "title": "Tech", "today_count": 3, "article_count": 60,
+                "articles": [… first 15 …],
+                "links": {"articles": "/v1/sections/topic-tech/articles", "next": "…?limit=15&cursor=…"}}],
+  "latest": {"articles": [… 45 …], "links": {"next": "/v1/articles?limit=45&cursor=…"}},
+  "saved": {"articles": [… 45 …], "missing_article_ids": ["A…"]}}}
+```
+
+`per_section` (0–60, default 15), `latest` and `saved` (0–100, default 45), `fields`, `ads` and
+`fetch_missing` work as elsewhere. The ETag is `W/"front-<version>-…"`; the version grows whenever
+any of it changes. `completeness` in a cached page can lag behind; `article.body_captured` says
+when a body arrives.
 
 ## Today
 
@@ -172,6 +240,25 @@ Events: `articles.added`, `article.body_captured`, `sections.updated`, `saved.up
 sections only as they scroll onto the screen, so a refresh that couldn't scroll (News's window on
 another Space) has Top Stories alone. The relay then keeps the sections of the feed before it, up
 to 36 hours old, after the new ones, until a newer feed has them again.
+
+### Deep sections
+
+News's Today feed shows three or four stories of a topic or publisher. With `deep=true` (on
+`/v1/sections` and `/v1/sections/{id}`, and always on `/v1/front` and
+`/v1/sections/{id}/articles`), a section carries Today's stories first, in News's order, then:
+
+- **a topic or channel whose own feed News has** (`feeddatabase`): that feed's stories published
+  in the last 48 hours (`--section-window-hours`), at least 10 from the last week, newest first,
+  at most two tellings of the same story;
+- **a channel without one:** the archive's stories from that publisher, the same way;
+- **Top Stories, For You, Trending and the like:** the stories the section carried in the last
+  24 hours, at most 20, most recently carried first.
+
+Only stories the relay has a record of are listed (News lists far more than it has loaded);
+sponsored stories are left out; at most 60 per section. `article_count` is the whole list,
+`today_count` how many the Today feed carries. `GET /v1/sections/{id}/articles?limit=&cursor=`
+pages through it; the cursor names the last story shown, so it follows on even when the list was
+rebuilt in between.
 
 ## History
 

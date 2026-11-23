@@ -16,6 +16,7 @@ from fixtures import NOW, FakeNews, anf_document
 CH = "TchannelAAAAAAAAAAAAAAA"
 CH2 = "TchannelBBBBBBBBBBBBBBB"
 TOPIC = "TtopicCCCCCCCCCCCCCCCCC"
+TECH = "TtechDDDDDDDDDDDDDDDDDD"
 
 
 def aid(n: int) -> str:
@@ -89,6 +90,7 @@ class FakeNewsApp(NewsApp):
         self.calls.append(("open_tag", tag_id))
         for n in range(500, 503):
             self.news.add_article(aid(n), "Channel story %d" % n, tag_id, published=NOW - n)
+        self.news.set_tag_feed(tag_id, [{"id": aid(n), "published": NOW - n} for n in range(500, 503)])
 
     def show_today(self):
         self.calls.append(("show_today",))
@@ -370,6 +372,315 @@ class ServiceTest(unittest.TestCase):
         self.get("/v1/saved?fetch_missing=true")
         jobs = [j for j in self.jobs.list() if j.kind == "fetch_article" and j.target == aid(999)]
         self.assertEqual([j.priority for j in jobs], ["background"])
+
+    # ------------------------------------------------ feeds and deep sections
+
+    def test_topic_links_from_feeds(self):
+        self.news.add_tag(TECH, "Gadgets", 1)
+        self.news.set_tag_feed(TECH, [{"id": aid(2), "topics": [TOPIC, "TnotATagEEEEEEEEEEEEEEE"]}, {"id": aid(4)}])
+        self.harvester.run_once()
+        _, body, _ = self.get("/v1/topics/%s/articles" % TECH)
+        self.assertEqual({a["id"] for a in body["data"]}, {aid(2), aid(4)})
+        _, body, _ = self.get("/v1/topics/%s/articles?limit=100" % TOPIC)
+        self.assertIn(aid(2), [a["id"] for a in body["data"]], "filed under a known topic by the feed")
+        _, body, _ = self.get("/v1/articles/%s?fetch=never" % aid(4))
+        self.assertIn("Gadgets", [t["name"] for t in body["data"]["topics"]])
+        _, body, _ = self.get("/v1/topics?limit=50")
+        self.assertEqual({t["name"]: t["article_count"] for t in body["data"]}["Gadgets"], 2)
+
+    def deep_setup(self):
+        self.store.clock = lambda: NOW + 600
+        self.news.add_tag(TECH, "Gadgets", 1)
+        self.news.write_feed([{"kindId": "TOP_STORIES:DEFAULT", "items": [aid(3), aid(1), aid(7)]},
+                              {"kindId": "EXTERNAL:TOPIC", "kind": "topic", "tagId": TECH, "items": [aid(2)]},
+                              {"kindId": "EXTERNAL:CHANNEL", "kind": "channel", "tagId": CH2, "items": [aid(3)]}],
+                             cursor="CURSOR-3", created=NOW + 1)
+        stories = [{"id": aid(n), "published": NOW - n * 3600, "channel": CH} for n in (4, 6, 8, 10, 12)]
+        stories += [{"id": aid(7), "published": NOW - 7 * 3600},                     # sponsored
+                    {"id": aid(14), "published": NOW - 14 * 3600, "cluster": "Csame"},
+                    {"id": aid(16), "published": NOW - 16 * 3600, "cluster": "Csame"},
+                    {"id": aid(18), "published": NOW - 18 * 3600, "cluster": "Csame"},  # a third telling
+                    {"id": "Anorecord00000000000001", "published": NOW},            # no record yet
+                    {"id": aid(2)}]                                                  # Today has it
+        self.news.set_tag_feed(TECH, stories)
+        self.harvester.run_once()
+
+    def deep_ids(self, slug):
+        _, body, _ = self.get("/v1/sections/%s?deep=true" % slug)
+        return [a["id"] for a in body["data"]["articles"]], body["data"]
+
+    def test_deep_topic_section(self):
+        self.deep_setup()
+        ids, data = self.deep_ids("topic-gadgets")
+        self.assertEqual(ids, [aid(n) for n in (2, 4, 6, 8, 10, 12, 14, 16)])
+        self.assertEqual((data["today_count"], data["article_count"]), (1, 8))
+        _, body, _ = self.get("/v1/sections/topic-gadgets")
+        self.assertEqual([a["id"] for a in body["data"]["articles"]], [aid(2)], "without deep, as in 0.2")
+
+    def test_channel_section_filled_from_archive(self):
+        self.deep_setup()
+        ids, _ = self.deep_ids("channel-another-paper")
+        self.assertEqual(ids, [aid(n) for n in range(3, 31, 3)])
+
+    def test_sections_without_a_feed_keep_what_they_carried(self):
+        self.deep_setup()
+        self.news.write_feed([{"kindId": "TOP_STORIES:DEFAULT", "items": [aid(9), aid(11)]}],
+                             cursor="CURSOR-4", created=NOW + 2)
+        self.harvester.run_once()
+        ids, data = self.deep_ids("top-stories")
+        self.assertEqual(ids, [aid(9), aid(11), aid(3), aid(1)], "Today's first, then earlier ones; sponsored dropped")
+        self.assertEqual(data["today_count"], 2)
+
+    def test_section_pages_walk_everything_once(self):
+        self.deep_setup()
+        seen, url = [], "/v1/sections/topic-gadgets/articles?limit=3"
+        while url:
+            status, body, _ = self.get(url)
+            self.assertEqual(status, 200)
+            seen += [a["id"] for a in body["data"]]
+            self.assertEqual(body["meta"]["total"], 8)
+            url = body["links"]["next"]
+        self.assertEqual(seen, self.deep_ids("topic-gadgets")[0])
+        self.assertEqual(self.get("/v1/sections/topic-gadgets/articles?cursor=bogus")[0], 400)
+
+    def test_feed_rescan_is_incremental(self):
+        from apple_news_relay import harvester as H
+        self.news.set_tag_feed(TECH, [{"id": aid(2)}])
+        self.news.set_tag_feed(TOPIC, [{"id": aid(3)}])
+        self.harvester.run_once()
+        calls, original = [], H.read_tag_feeds
+        H.read_tag_feeds = lambda paths, tags=None: (calls.append(tags), original(paths, tags))[1]
+        try:
+            self.news.set_tag_feed(TECH, [{"id": aid(2)}, {"id": aid(4)}])
+            report = self.harvester.run_once()
+        finally:
+            H.read_tag_feeds = original
+        self.assertEqual(calls, [[TECH]])
+        self.assertEqual(report.feeds, [TECH])
+
+    def test_no_change_no_event(self):
+        version, seen = self.store.front_version, []
+        self.harvester.on_event = lambda kind, data: seen.append(kind)
+        self.news.write_feed([{"kindId": "TOP_STORIES:DEFAULT", "items": [aid(3), aid(1), aid(7)]},
+                              {"kindId": "EXTERNAL:SMARTER_MESSAGING_(C)", "kind": "engagement", "items": []},
+                              {"kindId": "CUSTOM:POLITICS,_HEADLINES", "items": [aid(2), aid(4)]}])
+        self.harvester.run_once()
+        self.assertEqual(self.store.front_version, version)
+        self.assertNotIn("sections.updated", seen)
+        self.assertNotIn("front.updated", seen)
+        self.news.write_feed([{"kindId": "TOP_STORIES:DEFAULT", "items": [aid(1), aid(3)]}], cursor="C9", created=NOW + 5)
+        self.harvester.run_once()
+        self.assertGreater(self.store.front_version, version)
+        self.assertIn("front.updated", seen)
+
+    # ------------------------------------------------------------ front page
+
+    def test_front_and_not_modified(self):
+        status, body, resp = self.get("/v1/front?per_section=1&latest=3")
+        self.assertEqual(status, 200)
+        data = body["data"]
+        self.assertEqual([s["id"] for s in data["sections"]], ["top-stories", "politics-headlines"])
+        top = data["sections"][0]
+        self.assertEqual([a["id"] for a in top["articles"]], [aid(3)])
+        self.assertTrue(top["links"]["next"])
+        self.assertEqual([a["id"] for a in data["latest"]["articles"]], [aid(1), aid(2), aid(3)])
+        self.assertEqual([a["id"] for a in data["saved"]["articles"]], [aid(2)])
+        self.assertEqual(data["saved"]["missing_article_ids"], [aid(999)])
+        self.assertTrue(resp.etag)
+        status, body, _ = self.get("/v1/front?per_section=1&latest=3", headers={"If-None-Match": resp.etag})
+        self.assertEqual((status, body), (304, None))
+        self.assertNotEqual(self.get("/v1/front?per_section=2&latest=3")[2].etag, resp.etag, "the query counts")
+        self.news.add_article(aid(950), "Breaking", CH, published=NOW + 3600)
+        self.harvester.run_once()
+        status, body, again = self.get("/v1/front?per_section=1&latest=3", headers={"If-None-Match": resp.etag})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["data"]["latest"]["articles"][0]["id"], aid(950))
+        self.assertNotEqual(again.etag, resp.etag)
+
+    def test_front_fields_and_fetch_missing(self):
+        _, body, _ = self.get("/v1/front?per_section=1&fields=title&fetch_missing=true")
+        self.assertEqual(set(body["data"]["sections"][0]["articles"][0]), {"id", "type", "title"})
+        self.get("/v1/front?per_section=1&fields=title&fetch_missing=true")
+        jobs = [j for j in self.jobs.list() if j.target == aid(999)]
+        self.assertEqual(len(jobs), 1, "asked once, not on every load")
+
+    def test_saving_moves_the_front_version(self):
+        version = self.store.front_version
+        self.get("/v1/saved/%s?wait=10" % aid(3), "PUT")
+        self.assertGreater(self.store.front_version, version)
+
+    # -------------------------------------------------------------- bodies
+
+    def test_partial_body_head_and_rest(self):
+        _, full, _ = self.get("/v1/articles/%s?fetch=never" % aid(1))
+        blocks = full["data"]["body"]["blocks"]
+        _, head, _ = self.get("/v1/articles/%s?fetch=never&max_chars=150" % aid(1))
+        hb = head["data"]["body"]
+        self.assertTrue(0 < len(hb["blocks"]) < len(blocks))
+        self.assertEqual((hb["block_count"], hb["word_count"]), (len(blocks), full["data"]["body"]["word_count"]))
+        _, rest, _ = self.get("/v1/articles/%s?fetch=never&from_block=%d" % (aid(1), hb["next_block"]))
+        self.assertEqual(hb["blocks"] + rest["data"]["body"]["blocks"], blocks)
+        self.assertIsNone(rest["data"]["body"]["next_block"])
+        self.assertIsNone(full["data"]["body"]["next_block"])
+
+    def test_split_keeps_captions_with_their_picture(self):
+        from apple_news_relay.queries import split_blocks
+        blocks = [{"type": "paragraph", "text": "x" * 50}, {"type": "image"}, {"type": "caption", "text": "c"},
+                  {"type": "paragraph", "text": "y"}]
+        part, nxt = split_blocks(blocks, 0, 40)
+        self.assertEqual((len(part), nxt), (1, 1))
+        part, nxt = split_blocks(blocks, 1, 1)
+        self.assertEqual((part, nxt), (blocks[1:3], 3))
+        many = [{"type": "image"}] * 5
+        self.assertEqual(split_blocks(many, 0, 1000), (many[:3], 3), "three pictures at most")
+
+    def test_body_cache_follows_a_new_capture(self):
+        _, a, _ = self.get("/v1/articles/%s?fetch=never" % aid(1))
+        self.store.save_document("Adoc" + aid(1)[-6:], anf_document("Story 1", paragraphs=1), "text")
+        _, b, _ = self.get("/v1/articles/%s?fetch=never" % aid(1))
+        self.assertLess(b["data"]["body"]["block_count"], a["data"]["body"]["block_count"])
+
+    # ------------------------------------------------- interest (warming)
+
+    def hold_worker(self):
+        gate = threading.Event()
+        original = self.fake.open_tag
+        self.fake.open_tag = lambda t: (gate.wait(5), original(t))
+        busy = self.jobs.submit("open_tag", CH)
+        deadline = time.time() + 5
+        while busy.state != "running" and time.time() < deadline:
+            time.sleep(0.002)
+        self.addCleanup(gate.set)
+        return gate
+
+    def put_interest(self, client, ids):
+        return self.get("/v1/interest/" + client, "PUT", json.dumps({"articles": ids}).encode())
+
+    def wait_fetches(self, ids):
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            jobs = [j for j in self.jobs.list() if j.kind == "fetch_article" and j.target in ids]
+            if jobs and all(j.done.is_set() for j in jobs):
+                return jobs
+            time.sleep(0.005)
+        self.fail("fetches didn't finish")
+
+    def test_interest_supersedes(self):
+        gate = self.hold_worker()
+        A, B, C, D = aid(2), aid(4), aid(6), aid(8)
+        status, body, _ = self.put_interest("tv-test", [A, B, C])
+        self.assertEqual([s["state"] for s in body["data"]["articles"]], ["queued"] * 3)
+        self.jobs.set_interest("win-test", [A])  # another client wants A too
+        self.put_interest("tv-test", [D, B])
+        dropped = [j for j in self.jobs.list() if j.target == C][0]
+        self.assertEqual((dropped.state, dropped.result), ("cancelled", {"superseded": True}))
+        gate.set()
+        self.wait_fetches([A, B, D])
+        opened = [c[1] for c in self.fake.calls if c[0] == "open_article"]
+        self.assertNotIn(C, opened)
+        self.assertEqual(sorted(opened), sorted([A, B, D]))
+        self.assertLess(opened.index(D), opened.index(B), "in the order of the newest list")
+        self.assertEqual(self.get("/v1/interest/x", "PUT", b'{"articles":[]}')[0], 400)
+        self.assertEqual(self.get("/v1/interest/tv-test", "PUT", b'{"articles":"A"}')[0], 400)
+        self.assertEqual(self.get("/v1/interest/tv-test", "DELETE")[0], 204)
+
+    def test_interest_skips_cached_stories(self):
+        self.hold_worker()
+        _, body, _ = self.put_interest("tv-test", [aid(1), aid(2), "not-an-id"])
+        self.assertEqual(body["data"]["articles"], [{"id": aid(1), "state": "cached"}, {"id": aid(2), "state": "queued"}])
+        self.assertEqual(self.jobs.warming(), 1)
+        self.assertEqual(self.get("/v1/status")[1]["jobs"]["warming"], 1)
+
+    def test_superseded_fetch_stops_at_once(self):
+        self.jobs.BACKGROUND_FETCH_TIMEOUT = 1000  # it would otherwise wait for News much longer
+        self.fake.unopenable.add(aid(22))
+        self.jobs.set_interest("tv-test", [aid(22)])
+        job = [j for j in self.jobs.list() if j.target == aid(22)][0]
+        deadline = time.time() + 5
+        while job.state != "running" and time.time() < deadline:
+            time.sleep(0.002)
+        self.jobs.set_interest("tv-test", [])
+        self.assertTrue(job.done.wait(5))
+        self.assertEqual((job.state, job.result), ("cancelled", {"superseded": True}))
+
+    def test_background_fetch_gives_up_sooner(self):
+        self.fake.unopenable.add(aid(24))
+        self.jobs.set_interest("tv-test", [aid(24)])
+        job = self.wait_fetches([aid(24)])[0]
+        self.assertEqual((job.result["captured"], job.result["timed_out"]), (False, True))
+        self.assertEqual(self.jobs.set_interest("tv-test", [aid(24)]), [{"id": aid(24), "state": "failed_recently"}])
+        # someone opening it still gets a real try
+        again = self.jobs.submit("fetch_article", aid(24), "interactive")
+        self.assertIsNot(again, job)
+
+    def test_reader_adopts_a_warming_fetch(self):
+        gate = self.hold_worker()
+        self.jobs.set_interest("tv-test", [aid(2)])
+        _, body, _ = self.get("/v1/articles/%s?wait=0" % aid(2))
+        job = self.jobs.get(body["data"]["fetch_job"]["id"])
+        self.assertEqual((job.priority, job.owners), ("interactive", set()))
+        self.jobs.set_interest("tv-test", [])
+        self.assertEqual(job.state, "queued", "a newer list doesn't drop what someone waits for")
+        gate.set()
+        self.assertTrue(job.done.wait(10))
+        self.assertEqual(job.state, "succeeded")
+
+    def test_warming_runs_closer_together(self):
+        runner = JobRunner(self.store, self.harvester, self.fake, min_gap=0.5, warm_gap=0.05)
+        times, original = [], self.fake.open_article
+        self.fake.open_article = lambda a: (times.append(time.time()), original(a))
+        runner.start()
+        try:
+            runner.set_interest("tv-test", [aid(2), aid(4), aid(6)])
+            deadline = time.time() + 10
+            while len(times) < 3 and time.time() < deadline:
+                time.sleep(0.01)
+        finally:
+            runner.stop()
+        self.assertEqual(len(times), 3)
+        self.assertTrue(all(b - a < 0.4 for a, b in zip(times, times[1:])), times)
+
+    def test_open_tag_counts_feed_links(self):
+        status, body, _ = self.get("/v1/topics/%s/refresh?wait=10" % TOPIC, "POST")
+        self.assertEqual(body["data"]["state"], "succeeded")
+        self.assertEqual(body["data"]["result"]["new_articles"], 3)
+
+    # ------------------------------------------------------------- plumbing
+
+    def test_store_reuses_read_connections(self):
+        import os
+        import sqlite3
+        import tempfile
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = Store(os.path.join(tmp.name, "relay.db"))
+        first = store.read()
+        self.assertIs(store.read(), first)
+        other = []
+        t = threading.Thread(target=lambda: other.append(store.read()))
+        t.start()
+        t.join()
+        self.assertIsNot(other[0], first)
+        with self.assertRaises(sqlite3.OperationalError):
+            first.execute("INSERT INTO meta VALUES ('x', 'y')")
+        store.set_meta("k", "v")
+        self.assertEqual(first.execute("SELECT value FROM meta WHERE key = 'k'").fetchone()[0], "v", "sees new writes")
+
+    def test_events_start_with_hello(self):
+        resp = self.app.handle(Request("GET", "/v1/events", {}, b"", "127.0.0.1"))
+        chunks = []
+
+        def write(chunk):
+            chunks.append(chunk)
+            if len(chunks) == 2:
+                raise BrokenPipeError()
+        with self.assertRaises(BrokenPipeError):
+            resp.stream(write)
+        self.assertTrue(chunks[1].startswith(b"event: hello\n"))
+        hello = json.loads(chunks[1].split(b"data: ")[1])
+        self.assertEqual(hello["front_version"], self.store.front_version)
+        self.assertIn("interest", hello["features"])
+        self.assertIn("front", self.get("/v1")[1]["features"])
 
     # --------------------------------------------------------- handoff
 

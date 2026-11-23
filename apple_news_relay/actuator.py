@@ -33,7 +33,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Set
 
 from .harvester import Harvester
 from .store import Store
@@ -291,6 +291,11 @@ class Job:
     error: Optional[str] = None
     priority: str = "normal"
     done: threading.Event = field(default_factory=threading.Event, repr=False)
+    seq: int = 0                       # its current place in the queue; older entries are skipped
+    owners: Set[str] = field(default_factory=set)  # clients whose interest list asked for it
+    quiet: bool = False                # not recorded or announced until it starts
+    superseded: bool = False           # nobody wants it any more: stop at the next look
+    progress: Dict = field(default_factory=dict)   # kept across a step aside (Yielded)
 
     def to_dict(self) -> dict:
         return {"id": self.id, "kind": self.kind, "target": self.target, "state": self.state,
@@ -310,21 +315,40 @@ class Yielded(Exception):
     """A background job stepped aside for one someone is waiting on; it runs again later."""
 
 
+class Superseded(Exception):
+    """A background fetch nobody wants any more (a newer interest list left it out)."""
+
+
+class _Stop(Exception):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
 class JobRunner:
     """Runs one News job at a time and records each in the store."""
 
     TIMEOUTS = {"fetch_article": 25.0, "open_tag": 25.0, "refresh_today": 60.0, "search": 30.0,
                 "story_action": 20.0}
+    #: A background fetch gives up sooner: a story News is slow to open shouldn't hold up the next.
+    BACKGROUND_FETCH_TIMEOUT = 8.0
+    #: Stories one client may ask to have fetched ahead (``set_interest``).
+    MAX_INTEREST = 12
+    #: A background fetch that timed out isn't asked for again by interest lists for this long.
+    TIMED_OUT_RETRY = 1800.0
 
     def __init__(self, store: Store, harvester: Harvester, app: Optional[NewsApp] = None,
                  on_event: Optional[Callable[[str, dict], None]] = None, max_queue: int = 50,
-                 min_gap: float = 1.5, pace: float = 1.0):
+                 min_gap: float = 1.5, pace: float = 1.0, warm_gap: float = 0.6,
+                 pause_warm_in_front: bool = False):
         self.store = store
         self.harvester = harvester
         self.app = app or NewsApp()
         self.on_event = on_event or (lambda kind, data: None)
         self.max_queue = max_queue
         self.min_gap = min_gap
+        self.warm_gap = warm_gap  # between background story fetches (warming), instead of min_gap
+        self.pause_warm_in_front = pause_warm_in_front
         self.pace = pace  # scales every wait below; tests run at a fraction of real time
         self.timeouts = dict(self.TIMEOUTS)
         self._queue: "queue.PriorityQueue" = queue.PriorityQueue()
@@ -334,6 +358,7 @@ class JobRunner:
         self._thread: Optional[threading.Thread] = None
         self._last_action = 0.0
         self._opened: Dict[str, float] = {}  # stories the relay opened in News, and when
+        self._tag_opened: Dict[str, float] = {}  # channels and topics opened, and when
 
     # ------------------------------------------------------------ submit
 
@@ -347,32 +372,110 @@ class JobRunner:
             raise ValueError("unknown job kind")
         if priority not in PRIORITIES:
             raise ValueError("unknown priority")
+        announce = None
         with self._lock:
             for job in self._jobs.values():  # identical pending job: reuse it
                 if job.kind == kind and job.target == target and job.params == params \
                         and job.state in ("queued", "running"):
-                    if job.state == "queued" and PRIORITIES[priority] < PRIORITIES[job.priority]:
+                    if PRIORITIES[priority] < PRIORITIES[job.priority]:
                         job.priority = priority
-                        self._enqueue(job)  # the old queue entry is skipped once this one has run
-                    return job
-            if kind == "fetch_article":
+                        if job.state == "queued":
+                            self._enqueue(job)  # moves it; the old queue entry is skipped
+                    if priority == "interactive":
+                        # Someone waits on it now: no interest list may drop it.
+                        job.owners.clear()
+                        job.superseded = False
+                        if job.quiet and job.state == "queued":
+                            job.quiet = False
+                            announce = job
+                    break
+            else:
+                job = None
+            if job is None and kind == "fetch_article":
                 recent = [j for j in self._jobs.values() if j.kind == kind and j.target == target
                           and j.done.is_set() and j.finished_at and time.time() - j.finished_at < self.RETRY_AFTER
-                          and (j.state == "failed" or (j.result or {}).get("captured") is False)]
+                          and (j.state == "failed" or (j.result or {}).get("captured") is False)
+                          and not (j.result or {}).get("timed_out")]
                 if recent:
                     return max(recent, key=lambda j: j.finished_at or 0)
-            if sum(1 for j in self._jobs.values() if j.state == "queued") >= self.max_queue:
-                raise QueueFull("too many queued jobs")
-            job = Job(kind, target, params, priority=priority)
-            self._jobs[job.id] = job
-            self._prune()
-            self._enqueue(job)
-        self.store.put_job(job.to_dict())
-        self.on_event("job.updated", job.to_dict())
+            if job is None:
+                if sum(1 for j in self._jobs.values() if j.state == "queued") >= self.max_queue:
+                    raise QueueFull("too many queued jobs")
+                job = Job(kind, target, params, priority=priority)
+                self._jobs[job.id] = job
+                self._prune()
+                self._enqueue(job)
+                announce = job
+        if announce is not None:
+            self.store.put_job(announce.to_dict())
+            self.on_event("job.updated", announce.to_dict())
         return job
 
+    def set_interest(self, client: str, article_ids: List[str]) -> List[dict]:
+        """``client`` may open these stories next, most likely first: fetch the ones without a
+        body in the background, in this order. Replaces the client's previous list: its fetches
+        that are no longer listed (and nobody else wants) are cancelled, or stopped if running.
+        Returns each story's state: cached, queued, running, failed_recently or skipped."""
+        ids = [i for i in dict.fromkeys(article_ids) if ARTICLE_ID.match(i)][:self.MAX_INTEREST]
+        cached = set()
+        if ids:
+            cached = {r[0] for r in self.store.read().execute(
+                "SELECT id FROM articles WHERE has_body = 1 AND id IN (%s)" % ",".join("?" * len(ids)), ids)}
+        now = time.time()
+        states: Dict[str, str] = {}
+        dropped: List[Job] = []
+        with self._lock:
+            wanted = set(ids)
+            for job in list(self._jobs.values()):
+                if client in job.owners and job.target not in wanted:
+                    job.owners.discard(client)
+                    if not job.owners and job.priority == "background" and job.state in ("queued", "running"):
+                        if job.state == "queued":
+                            dropped.append(job)
+                        else:
+                            job.superseded = True
+            for article_id in ids:
+                if article_id in cached:
+                    states[article_id] = "cached"
+                    continue
+                pending = next((j for j in self._jobs.values() if j.kind == "fetch_article"
+                                and j.target == article_id and j.state in ("queued", "running")), None)
+                if pending is not None:
+                    if pending.priority == "background":
+                        pending.owners.add(client)
+                        pending.superseded = False
+                        if pending.state == "queued":
+                            self._enqueue(pending)  # to its place in this list
+                    states[article_id] = pending.state
+                    continue
+                failed = any(j.kind == "fetch_article" and j.target == article_id and j.done.is_set()
+                             and j.finished_at and (
+                                 (now - j.finished_at < self.TIMED_OUT_RETRY and (j.result or {}).get("timed_out"))
+                                 or (now - j.finished_at < self.RETRY_AFTER and not (j.result or {}).get("timed_out")
+                                     and (j.state == "failed" or (j.result or {}).get("captured") is False)))
+                             for j in self._jobs.values())
+                if failed:
+                    states[article_id] = "failed_recently"
+                    continue
+                if sum(1 for j in self._jobs.values() if j.state == "queued") >= self.max_queue:
+                    states[article_id] = "skipped"
+                    continue
+                job = Job("fetch_article", article_id, {}, priority="background", owners={client}, quiet=True)
+                self._jobs[job.id] = job
+                self._enqueue(job)
+                states[article_id] = "queued"
+            self._prune()
+            for job in dropped:
+                self._finish(job, "cancelled", {"superseded": True})
+        return [{"id": i, "state": states[i]} for i in ids]
+
+    def warming(self) -> int:
+        """Background fetches queued or running for clients' interest lists."""
+        return sum(1 for j in list(self._jobs.values()) if j.owners and j.state in ("queued", "running"))
+
     def _enqueue(self, job: Job):
-        self._queue.put((PRIORITIES[job.priority], next(self._order), job))
+        job.seq = next(self._order)
+        self._queue.put((PRIORITIES[job.priority], job.seq, job))
 
     def get(self, job_id: str) -> Optional[Job]:
         return self._jobs.get(job_id)
@@ -381,9 +484,10 @@ class JobRunner:
         return sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
 
     def cancel(self, job_id: str) -> Optional[Job]:
-        job = self._jobs.get(job_id)
-        if job and job.state == "queued":
-            self._finish(job, "cancelled")
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job and job.state == "queued":
+                self._finish(job, "cancelled")
         return job
 
     def _prune(self, keep: int = 500):
@@ -420,19 +524,41 @@ class JobRunner:
         running = any(j.state == "running" for j in list(self._jobs.values()))
         return running or time.time() - self._last_action < settle
 
+    def _gap(self, job: Job) -> float:
+        """Time to leave since the last News action: someone waiting on it goes almost at once,
+        warming (background story fetches) follows briskly, refreshes keep their distance."""
+        if job.priority == "interactive":
+            return min(self.min_gap, 0.25)
+        if job.priority == "background" and job.kind == "fetch_article":
+            return min(self.min_gap, self.warm_gap)
+        return self.min_gap
+
     def _work(self):
         while True:
-            _, _, job = self._queue.get()
+            _, seq, job = self._queue.get()
             if job is None:
                 return
-            if job.state != "queued":
-                continue
-            # Someone waiting on it goes almost at once; prefetching and refreshes keep their distance.
-            gap = (min(self.min_gap, 0.25) if job.priority == "interactive" else self.min_gap) \
-                - (time.time() - self._last_action)
+            with self._lock:
+                if job.state != "queued" or seq != job.seq:
+                    continue  # cancelled, or moved to a newer place in the queue
+            gap = self._gap(job) - (time.time() - self._last_action)
             if gap > 0:
                 time.sleep(gap)
-            job.state, job.started_at = "running", time.time()
+            if self.pause_warm_in_front and job.priority == "background" and job.kind == "fetch_article":
+                try:
+                    in_front = self.app.front_bundle() == "com.apple.news"
+                except Exception:
+                    in_front = False
+                if in_front:  # someone reads News on the Mac: don't swap stories under them
+                    time.sleep(2.0 * self.pace)
+                    with self._lock:
+                        if job.state == "queued" and job.seq == seq:
+                            self._enqueue(job)
+                    continue
+            with self._lock:
+                if job.state != "queued" or seq != job.seq:
+                    continue
+                job.state, job.started_at = "running", time.time()
             self.store.put_job(job.to_dict())
             self.on_event("job.updated", job.to_dict())
             try:
@@ -444,14 +570,21 @@ class JobRunner:
                 self.on_event("job.updated", job.to_dict())
                 with self._lock:
                     self._enqueue(job)
+            except Superseded:
+                self._finish(job, "cancelled", {"superseded": True})
             except Exception as e:
                 log.warning("job %s %s failed: %s", job.kind, job.target, e)
                 job.error = str(e)[:300]
                 self._finish(job, "failed")
             self._last_action = time.time()
 
-    def _finish(self, job: Job, state: str):
+    def _finish(self, job: Job, state: str, result: Optional[Dict] = None):
         job.state, job.finished_at = state, time.time()
+        if result is not None:
+            job.result = result
+        if job.quiet and job.started_at is None:
+            job.done.set()  # never started, never announced: nothing to tell anyone
+            return
         self.store.put_job(job.to_dict())
         job.done.set()
         self.on_event("job.updated", job.to_dict())
@@ -463,18 +596,29 @@ class JobRunner:
         return any(j.state == "queued" and j.priority == "interactive" for j in list(self._jobs.values()))
 
     def _wait_for(self, predicate: Callable[[], bool], timeout: float, poll: float = 1.0,
-                  yielding: bool = False) -> bool:
+                  yielding: bool = False, stop: Optional[Callable[[], Optional[str]]] = None,
+                  yield_after: float = 0.0, bodies_only: bool = False) -> bool:
         """Harvests until ``predicate`` holds or ``timeout`` passes. ``yielding``: raise
-        :class:`Yielded` as soon as an interactive job is queued."""
+        :class:`Yielded` as soon as an interactive job is queued (after ``yield_after`` seconds).
+        ``stop``: returns a reason to give up early (raised as ``_Stop``). ``bodies_only``: between
+        full passes (one a second), only look for new story bodies, which costs a couple of ms."""
         timeout *= self.pace
         start = time.time()
         deadline = start + timeout
+        full_at = 0.0
         while time.time() < deadline:
-            self.harvester.run_once()
+            if not bodies_only or time.time() - full_at >= 1.0 * self.pace:
+                self.harvester.run_once()
+                full_at = time.time()
+            else:
+                self.harvester.run_documents()
             if predicate():
                 return True
-            if yielding and self._urgent_waiting():
+            if yielding and time.time() - start >= yield_after * self.pace and self._urgent_waiting():
                 raise Yielded()
+            reason = stop() if stop else None
+            if reason:
+                raise _Stop(reason)
             # News usually writes a story within a second: look often at first (a pass costs a few
             # ms when nothing changed), then settle to ``poll``.
             time.sleep((0.15 if time.time() - start < 4 else poll) * self.pace)
@@ -500,8 +644,23 @@ class JobRunner:
             return {"captured": True, "already_cached": True}
         start = time.time()
         self._open(article_id)
-        ok = self._wait_for(lambda: self._has_body(article_id), self.timeouts["fetch_article"],
-                            yielding=job.priority == "background")
+
+        def stop() -> Optional[str]:
+            if job.superseded:
+                return "superseded"
+            if job.priority == "background" and \
+                    time.time() - start > self.BACKGROUND_FETCH_TIMEOUT * self.pace:
+                return "timed_out"
+            return None
+        try:
+            ok = self._wait_for(lambda: self._has_body(article_id), self.timeouts["fetch_article"],
+                                yielding=job.priority == "background", stop=stop, bodies_only=True)
+        except _Stop as e:
+            if self._has_body(article_id):
+                return {"captured": True, "seconds": round(time.time() - start, 1)}
+            if e.reason == "superseded":
+                raise Superseded()
+            return {"captured": False, "timed_out": True, "seconds": round(time.time() - start, 1)}
         return {"captured": ok, "seconds": round(time.time() - start, 1)}
 
     def _count_tag(self, tag_id: str) -> int:
@@ -509,11 +668,18 @@ class JobRunner:
             "SELECT COUNT(*) FROM article_tags WHERE tag_id = ?", (tag_id,)).fetchone()[0]
 
     def _run_open_tag(self, job: Job) -> dict:
+        """Open a channel or topic in News: it loads that feed (and records for its stories), which
+        the harvester links to the tag. Steps aside for a story someone opens after 3 s."""
         tag_id = job.target or ""
-        before = self._count_tag(tag_id)
-        since = time.time()
-        self.app.open_tag(tag_id)
-        self._wait_for(lambda: self._count_tag(tag_id) > before, self.timeouts["open_tag"])
+        if "before" not in job.progress:
+            job.progress["before"] = self._count_tag(tag_id)
+            job.progress["since"] = time.time()
+        before, since = job.progress["before"], job.progress["since"]
+        if time.time() - self._tag_opened.get(tag_id, 0) > 60 * self.pace:
+            self._tag_opened[tag_id] = time.time()
+            self.app.open_tag(tag_id)
+        self._wait_for(lambda: self._count_tag(tag_id) > before, self.timeouts["open_tag"],
+                       yielding=True, yield_after=3.0)
         self._sleep(3)  # records keep arriving for a few seconds after the first batch
         self.harvester.run_once()
         return {"new_articles": self._count_tag(tag_id) - before, "seconds": round(time.time() - since, 1)}
@@ -612,6 +778,7 @@ class JobRunner:
         if key == "saved":
             self.store.set_saved(article_id, bool(want))
             self.on_event("saved.updated", {"article_id": article_id, "saved": bool(want)})
+            self.on_event("front.updated", {"version": self.store.front_version})
         self.store.set_reaction(article_id, state.reaction)
         return {"saved": state.saved, "reaction": state.reaction, "changed": changed,
                 "seconds": round(time.time() - start, 1)}

@@ -230,36 +230,83 @@ def article_summary(row: sqlite3.Row, entitled: bool) -> dict:
     }
 
 
-def article_body(conn: sqlite3.Connection, store, row: sqlite3.Row, entitled: bool, include_ads: bool) -> Optional[dict]:
+#: Block types that are pictures or players; a head (see ``split_blocks``) holds at most three.
+MEDIA_BLOCKS = {"image", "gallery", "video", "audio", "embed"}
+TEXT_BLOCKS = {"paragraph", "heading", "quote", "caption"}
+
+
+def split_blocks(blocks: List[dict], from_block: int, max_chars: int) -> Tuple[List[dict], Optional[int]]:
+    """A run of blocks from ``from_block``: everything to the end when ``max_chars`` is 0,
+    otherwise about ``max_chars`` of text (a couple of screens), at most 3 pictures or players and
+    25 blocks. A caption stays with its picture. Returns the blocks and the index the rest starts
+    at (None when the story ends here)."""
+    start = max(0, min(from_block, len(blocks)))
+    if not max_chars:
+        return blocks[start:], None
+    end, chars, media = start, 0, 0
+    while end < len(blocks):
+        b = blocks[end]
+        if b.get("type") in MEDIA_BLOCKS:
+            if media >= 3:
+                break
+            media += 1
+        end += 1
+        if b.get("type") in TEXT_BLOCKS:
+            chars += len(b.get("text", ""))
+        if chars >= max_chars or end - start >= 25:
+            break
+    while end < len(blocks) and blocks[end].get("type") == "caption":
+        end += 1
+    if end == start and end < len(blocks):
+        end += 1
+    return blocks[start:end], (end if end < len(blocks) else None)
+
+
+def article_body(conn: sqlite3.Connection, store, row: sqlite3.Row, entitled: bool, include_ads: bool,
+                 from_block: int = 0, max_chars: int = 0) -> Optional[dict]:
+    """The story's body, or a part of it (``from_block``, ``max_chars``: see ``split_blocks``).
+    ``block_count`` and ``word_count`` always describe the whole story."""
     if not row["has_body"]:
         return None
-    doc = store.document_for(row["id"], conn=conn)
-    if doc is None:
+    converted = store.converted(row["id"], include_ads, conn=conn)
+    if converted is None:
         return None
-    converted = anf.convert(doc, keep_promotions=include_ads)
     blocks = converted.blocks
     state = completeness(row, entitled)
     if state == "preview":
         blocks = anf.preview(blocks)
+    part, next_block = split_blocks(blocks, from_block, max_chars)
     return {
-        "blocks": blocks,
+        "blocks": part,
         "subtitle": converted.subtitle,
         "byline": anf.clean_byline(converted.byline, row["channel_name"]),
         "word_count": sum(len(b.get("text", "").split()) for b in blocks if "text" in b),
         "truncated": state == "preview",
         "removed": converted.removed,
+        "block_count": len(blocks),
+        "from_block": min(max(0, from_block), len(blocks)),
+        "next_block": next_block,
     }
 
 
-def article_detail(conn: sqlite3.Connection, store, row: sqlite3.Row, entitled: bool, include_ads: bool) -> dict:
-    out = article_summary(row, entitled)
+def article_topics(conn: sqlite3.Connection, row: sqlite3.Row, limit: int = 6) -> List[dict]:
+    """The story's topics: from its record first, then the topic feeds that list it."""
     tag_ids = loads(row["topic_ids"], [])
-    topics = []
-    if tag_ids:
-        names = {r["id"]: r for r in conn.execute(
-            "SELECT id, name, kind FROM tags WHERE id IN (%s)" % ",".join("?" * len(tag_ids)), tag_ids)}
-        topics = [{"id": t, "name": names[t]["name"]} for t in tag_ids
-                  if t in names and names[t]["kind"] == "topic"]
+    tag_ids += [r[0] for r in conn.execute(
+        "SELECT x.tag_id FROM article_tags x JOIN tags t ON t.id = x.tag_id WHERE x.article_id = ? "
+        "AND t.kind = 'topic' ORDER BY t.name", (row["id"],)) if r[0] not in tag_ids]
+    if not tag_ids:
+        return []
+    names = {r["id"]: r for r in conn.execute(
+        "SELECT id, name, kind FROM tags WHERE id IN (%s)" % ",".join("?" * len(tag_ids)), tag_ids)}
+    return [{"id": t, "name": names[t]["name"]} for t in tag_ids
+            if t in names and names[t]["kind"] == "topic"][:limit]
+
+
+def article_detail(conn: sqlite3.Connection, store, row: sqlite3.Row, entitled: bool, include_ads: bool,
+                   from_block: int = 0, max_chars: int = 0) -> dict:
+    out = article_summary(row, entitled)
+    topics = article_topics(conn, row)
     placements = [{
         "section": r["section_slug"], "title": r["title"], "best_position": r["best_position"] + 1,
         "first_seen_at": iso(r["first_seen"]), "last_seen_at": iso(r["last_seen"]),
@@ -279,7 +326,7 @@ def article_detail(conn: sqlite3.Connection, store, row: sqlite3.Row, entitled: 
         "saved_at": iso(saved[0]) if saved else None,
         "reaction": reaction[0] if reaction else None,
         "placements": placements,
-        "body": article_body(conn, store, row, entitled, include_ads),
+        "body": article_body(conn, store, row, entitled, include_ads, from_block, max_chars),
     })
     out["links"].update({
         "fetch": "/v1/articles/%s/fetch" % row["id"],
@@ -324,7 +371,7 @@ def list_tags(conn: sqlite3.Connection, kinds: Sequence[str], q: Optional[str], 
         if len(c) != 2 or c[0] != sort:
             raise CursorError("cursor belongs to a different sort order")
         offset = int(c[1])
-    sql = ("SELECT t.*, COUNT(x.article_id) AS article_count, MAX(a.published_at) AS latest_published_at "
+    sql = ("SELECT t.*, COUNT(a.id) AS article_count, MAX(a.published_at) AS latest_published_at "
            "FROM tags t LEFT JOIN article_tags x ON x.tag_id = t.id LEFT JOIN articles a ON a.id = x.article_id "
            "WHERE t.kind IN (%s)" % ",".join("?" * len(kinds)))
     args: List[Any] = list(kinds)
@@ -345,6 +392,40 @@ def list_tags(conn: sqlite3.Connection, kinds: Sequence[str], q: Optional[str], 
 # --------------------------------------------------------------------------
 # Sections
 # --------------------------------------------------------------------------
+
+def section_ids(conn: sqlite3.Connection, slug: str) -> List[Tuple[str, str]]:
+    """A section's full story list (``Store.compose_sections``): ``[(article id, source)]``."""
+    return [(r[0], r[1]) for r in conn.execute(
+        "SELECT article_id, source FROM section_items WHERE slug = ? ORDER BY position", (slug,))]
+
+
+def section_page(conn: sqlite3.Connection, slug: str, items: List[Tuple[str, str]], entitled: bool,
+                 include_ads: bool, limit: int, cursor: Optional[str]) -> Tuple[List[dict], Optional[str]]:
+    """One page of a section's stories. The cursor names the last story shown, so a page still
+    follows on when the list was rebuilt in between (it falls back to the position)."""
+    start = 0
+    if cursor:
+        c = decode_cursor(cursor)
+        if len(c) != 4 or c[0] != "section" or c[1] != slug:
+            raise CursorError("cursor belongs to a different list")
+        ids = [i for i, _ in items]
+        start = ids.index(c[2]) + 1 if c[2] in ids else int(c[3]) + 1
+    known = get_article_rows(conn, [i for i, _ in items[start:start + limit * 2 + 10]])
+    out: List[dict] = []
+    pos = start
+    while pos < len(items) and len(out) < limit:
+        article_id, source = items[pos]
+        row = known.get(article_id)
+        if row is None and article_id not in known:
+            row = get_article_rows(conn, [article_id]).get(article_id)
+        if row is not None and (include_ads or not row["sponsored"]):
+            item = article_summary(row, entitled)
+            item["source"] = source
+            out.append(item)
+        pos += 1
+    nxt = encode_cursor(["section", slug, items[pos - 1][0], pos - 1]) if pos < len(items) and out else None
+    return out, nxt
+
 
 def section_json(row: sqlite3.Row) -> dict:
     ids = loads(row["article_ids"], [])

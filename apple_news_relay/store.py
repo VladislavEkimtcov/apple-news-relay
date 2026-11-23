@@ -16,11 +16,26 @@ import sqlite3
 import threading
 import time
 import zlib
-from typing import Iterable, List, Optional
+from collections import Counter, OrderedDict
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
-from .newscache import ArticleRecord, HistoryItem, SavedStory, Section, TagRecord
+from .newscache import ArticleRecord, FeedItem, HistoryItem, SavedStory, Section, TagRecord
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+#: Section depth (see compose_sections): stories from a topic's or channel's feed published in the
+#: last DEEP_WINDOW, at least DEEP_MIN when the feed has them within DEEP_FALLBACK; sections with no
+#: feed keep up to EARLIER_MAX stories they carried in the last EARLIER_WINDOW.
+DEEP_WINDOW = 48 * 3600.0
+DEEP_FALLBACK = 7 * 86400.0
+DEEP_MIN = 10
+EARLIER_WINDOW = 24 * 3600.0
+EARLIER_MAX = 20
+SECTION_MAX = 60
+PER_CLUSTER = 2
+#: Converted bodies kept in memory (anf.convert costs up to ~10 ms for a long story).
+BODY_CACHE = 300
+LATEST_SIZE = 45
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -143,6 +158,36 @@ CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created_at DESC);
 CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(
     article_id UNINDEXED, title, excerpt, byline, body, tokenize = 'porter unicode61'
 );
+
+-- Schema 2: channel and topic feeds, and the sections built from them.
+CREATE TABLE IF NOT EXISTS feed_items (
+    tag_id TEXT NOT NULL,            -- the channel or topic whose feed listed the story
+    article_id TEXT NOT NULL,
+    feed_order INTEGER,
+    published_at REAL,
+    cluster_id TEXT,
+    first_seen REAL NOT NULL,
+    last_seen REAL NOT NULL,
+    PRIMARY KEY (tag_id, article_id)
+);
+CREATE INDEX IF NOT EXISTS feed_items_tag_published ON feed_items(tag_id, published_at DESC);
+CREATE INDEX IF NOT EXISTS feed_items_article ON feed_items(article_id);
+
+CREATE TABLE IF NOT EXISTS feed_state (
+    feed_id TEXT PRIMARY KEY,
+    signature TEXT NOT NULL,         -- changes when News refreshes or extends the feed
+    scanned_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS section_items (
+    slug TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    article_id TEXT NOT NULL,
+    source TEXT NOT NULL,            -- today | feed | channel | earlier
+    PRIMARY KEY (slug, position)
+);
+
+CREATE INDEX IF NOT EXISTS placements_section ON placements(section_slug, last_seen DESC);
 """
 
 
@@ -186,33 +231,98 @@ class _TakingTurns:
 
 
 class Store:
-    """Thread-safe access to the relay database. Reads open short-lived
-    connections; writes go through one lock."""
+    """Thread-safe access to the relay database. Each thread keeps one read-only connection;
+    writes go through one lock."""
 
-    def __init__(self, path: Optional[str] = None):
+    def __init__(self, path: Optional[str] = None, section_window: float = DEEP_WINDOW):
         self.path = path or default_path()
         if self.path != ":memory:":
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
         self._lock = threading.RLock()
+        self._local = threading.local()
         self._writer = self._open()
+        self.section_window = section_window
+        self.clock = time.time  # what "now" is for section windows (tests set it)
+        # Grows whenever what a front page shows changes (sections, Latest, Saved); never goes back,
+        # even across restarts, so clients can use it as a validator.
+        self.front_version = int(time.time() * 1000)
+        self._latest: Tuple[str, ...] = ()
+        self._bodies: "OrderedDict[Tuple[str, bool], object]" = OrderedDict()
+        self._bodies_lock = threading.Lock()
         with self._lock:
             self._writer.executescript(SCHEMA)
             self._writer.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
             self._writer.commit()
 
-    def _open(self) -> sqlite3.Connection:
+    def _open(self, reader: bool = False) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        if reader:
+            conn.execute("PRAGMA query_only=1")
+            return conn
         if self.path != ":memory:":
             conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=OFF")
         return conn
 
     def read(self):
-        """A connection for reading. In-memory stores share the writer, one thread at a time."""
+        """A connection for reading, kept per thread. In-memory stores share the writer, one
+        thread at a time."""
         if self.path == ":memory:":
             return _TakingTurns(self._writer, self._lock)
-        return self._open()
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self._local.conn = self._open(reader=True)
+        return conn
+
+    # --------------------------------------------------------- front version
+
+    def bump_front(self) -> int:
+        """Something a front page shows changed. Returns the new version."""
+        with self._lock:
+            self.front_version = max(self.front_version + 1, int(time.time() * 1000))
+            return self.front_version
+
+    def latest_changed(self) -> bool:
+        """Whether the newest stories (the front page's Latest) differ from the last look."""
+        with self._lock:
+            ids = tuple(r[0] for r in self._writer.execute(
+                "SELECT id FROM articles WHERE sponsored = 0 ORDER BY COALESCE(published_at, 0) DESC, id DESC "
+                "LIMIT ?", (LATEST_SIZE,)))
+            changed = ids != self._latest
+            self._latest = ids
+            return changed
+
+    # ------------------------------------------------------ converted bodies
+
+    def converted(self, article_id: str, keep_promotions: bool = False, conn=None):
+        """The story's body as ``anf.Document``, converted once and kept (``BODY_CACHE`` of them)."""
+        key = (article_id, bool(keep_promotions))
+        with self._bodies_lock:
+            hit = self._bodies.get(key)
+            if hit is not None:
+                self._bodies.move_to_end(key)
+                return hit
+        doc = self.document_for(article_id, conn=conn)
+        if doc is None:
+            return None
+        from .anf import convert
+        result = convert(doc, keep_promotions=keep_promotions)
+        self.remember_converted(article_id, keep_promotions, result)
+        return result
+
+    def remember_converted(self, article_id: str, keep_promotions: bool, result):
+        key = (article_id, bool(keep_promotions))
+        with self._bodies_lock:
+            self._bodies[key] = result
+            self._bodies.move_to_end(key)
+            while len(self._bodies) > BODY_CACHE:
+                self._bodies.popitem(last=False)
+
+    def forget_converted(self, article_id: str):
+        with self._bodies_lock:
+            for keep in (False, True):
+                self._bodies.pop((article_id, keep), None)
 
     # ------------------------------------------------------------------ meta
 
@@ -304,6 +414,8 @@ class Store:
             if article_id:
                 self._index_body(cur, article_id, body_text)
             self._writer.commit()
+        if article_id:
+            self.forget_converted(article_id)
         return article_id
 
     def _index_body(self, cur: sqlite3.Cursor, article_id: str, body_text: Optional[str] = None):
@@ -329,11 +441,17 @@ class Store:
         with self._lock:
             return self._writer.execute("SELECT 1 FROM documents WHERE asset_id = ?", (asset_id,)).fetchone() is not None
 
-    def update_sections(self, sections: List[Section], now: Optional[float] = None):
-        """Record the current Today feed and extend placement history."""
+    def _current_sections(self, cur) -> Dict[str, tuple]:
+        return {r[0]: tuple(r[1:]) for r in cur.execute(
+            "SELECT slug, title, position, article_ids, promotional, tag_id FROM sections WHERE position IS NOT NULL")}
+
+    def update_sections(self, sections: List[Section], now: Optional[float] = None) -> bool:
+        """Record the current Today feed and extend placement history. Returns whether the
+        sections (titles, order or stories) changed; placement history alone doesn't count."""
         now = now or time.time()
         with self._lock:
             cur = self._writer.cursor()
+            before = self._current_sections(cur)
             cur.execute("UPDATE sections SET position = NULL")
             seen = set()
             for pos, s in enumerate(sections):
@@ -348,14 +466,18 @@ class Store:
                 if slug in seen:
                     slug = "%s-%d" % (slug, pos)
                 seen.add(slug)
+                ids = dumps(s.article_ids)
                 cur.execute(
                     """INSERT INTO sections (slug, kind, title, group_type, tag_id, promotional, position, article_ids,
                          updated_at, first_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(slug) DO UPDATE SET kind = excluded.kind, title = excluded.title,
                          group_type = excluded.group_type, tag_id = COALESCE(excluded.tag_id, sections.tag_id),
                          promotional = excluded.promotional, position = excluded.position,
-                         article_ids = excluded.article_ids, updated_at = excluded.updated_at""",
-                    (slug, s.kind, title, s.group_type, s.tag_id, int(s.promotional), pos, dumps(s.article_ids), now, now))
+                         article_ids = excluded.article_ids,
+                         updated_at = CASE WHEN sections.article_ids = excluded.article_ids
+                                            AND sections.title = excluded.title
+                                           THEN sections.updated_at ELSE excluded.updated_at END""",
+                    (slug, s.kind, title, s.group_type, s.tag_id, int(s.promotional), pos, ids, now, now))
                 for i, article_id in enumerate(s.article_ids):
                     cur.execute(
                         """INSERT INTO placements VALUES (?, ?, ?, ?, ?)
@@ -363,12 +485,16 @@ class Store:
                              best_position = MIN(placements.best_position, excluded.best_position),
                              last_seen = excluded.last_seen""",
                         (slug, article_id, i, now, now))
+            after = self._current_sections(cur)
             self._writer.commit()
+        return before != after
 
-    def update_saved(self, saved: List[SavedStory], now: Optional[float] = None):
+    def update_saved(self, saved: List[SavedStory], now: Optional[float] = None) -> bool:
+        """Mirror News's Saved Stories. Returns whether the set of saved stories changed."""
         now = now or time.time()
         with self._lock:
             cur = self._writer.cursor()
+            before = self._saved_ids(cur)
             ids = [s.article_id for s in saved]
             for s in saved:
                 cur.execute("""INSERT INTO saved VALUES (?, ?, NULL)
@@ -377,12 +503,20 @@ class Store:
             if ids:
                 cur.execute("UPDATE saved SET removed_at = ? WHERE removed_at IS NULL AND article_id NOT IN (%s)"
                             % ",".join("?" * len(ids)), [now] + ids)
+            after = self._saved_ids(cur)
             self._writer.commit()
+        return before != after
+
+    @staticmethod
+    def _saved_ids(cur) -> Set[str]:
+        return {r[0] for r in cur.execute("SELECT article_id FROM saved WHERE removed_at IS NULL")}
 
     def set_saved(self, article_id: str, saved: bool, now: Optional[float] = None):
-        """Records a save or unsave the relay made, before News's own list catches up."""
+        """Records a save or unsave the relay made, before News's own list catches up. A change
+        moves the front version on."""
         now = now or time.time()
         with self._lock:
+            self.front_version = max(self.front_version + 1, int(time.time() * 1000))
             if saved:
                 self._writer.execute("""INSERT INTO saved VALUES (?, ?, NULL) ON CONFLICT(article_id) DO UPDATE SET
                                         saved_at = COALESCE(saved.saved_at, excluded.saved_at), removed_at = NULL
@@ -411,6 +545,143 @@ class Store:
                    read_at = MAX(COALESCE(history.read_at, 0), COALESCE(excluded.read_at, 0))""",
                 [(h.article_id, h.read_at) for h in items])
             self._writer.commit()
+
+    # ------------------------------------------------- channel and topic feeds
+
+    def feed_signatures(self) -> Dict[str, str]:
+        with self._lock:
+            return {r[0]: r[1] for r in self._writer.execute("SELECT feed_id, signature FROM feed_state")}
+
+    def upsert_feed_items(self, items: Iterable[FeedItem], signatures: Dict[str, str],
+                          now: Optional[float] = None) -> Set[str]:
+        """Record which stories each channel's and topic's feed lists, and link the stories to the
+        feed's tag, its publisher and the topics News filed them under (only tags the relay knows;
+        most of the ids News files stories under have no tag record). ``signatures``: the feeds
+        read, to remember. Returns the tags whose feeds gained or changed stories."""
+        now = now or time.time()
+        touched: Set[str] = set()
+        with self._lock:
+            cur = self._writer.cursor()
+            known = {r[0] for r in cur.execute("SELECT id FROM tags")}
+            rows: Dict[Tuple[str, str], tuple] = {}
+            links: Set[Tuple[str, str]] = set()
+            for it in items:
+                key = (it.tag_id, it.article_id)
+                prev = rows.get(key)
+                if prev is None or (it.order or 0) > (prev[0] or 0):
+                    rows[key] = (it.order, it.published_at, it.cluster_id)
+                links.add((it.article_id, it.tag_id))
+                if it.channel_id:
+                    links.add((it.article_id, it.channel_id))
+                for t in it.topic_ids:
+                    if t in known:
+                        links.add((it.article_id, t))
+            for (tag_id, article_id), (order, published, cluster) in rows.items():
+                cur.execute(
+                    """INSERT INTO feed_items VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(tag_id, article_id) DO UPDATE SET
+                         feed_order = MAX(COALESCE(feed_items.feed_order, 0), COALESCE(excluded.feed_order, 0)),
+                         published_at = COALESCE(excluded.published_at, feed_items.published_at),
+                         cluster_id = COALESCE(excluded.cluster_id, feed_items.cluster_id),
+                         last_seen = excluded.last_seen
+                       WHERE feed_items.feed_order IS NOT excluded.feed_order
+                          OR feed_items.cluster_id IS NOT excluded.cluster_id""",
+                    (tag_id, article_id, order, published, cluster, now, now))
+                if cur.rowcount:
+                    touched.add(tag_id)
+            cur.executemany("INSERT OR IGNORE INTO article_tags VALUES (?, ?)", sorted(links))
+            cur.executemany("INSERT OR REPLACE INTO feed_state VALUES (?, ?, ?)",
+                            [(f, s, now) for f, s in signatures.items()])
+            self._writer.commit()
+        return touched
+
+    def compose_sections(self, now: Optional[float] = None) -> List[str]:
+        """Build each current section's full story list (``section_items``): the Today feed's
+        stories first, in News's order, then more of the same kind:
+
+        * a topic or channel whose feed News has: that feed's stories from the last
+          ``section_window`` (at least ``DEEP_MIN`` from the last week), newest first, at most
+          ``PER_CLUSTER`` versions of one story;
+        * a channel without a feed: the archive's stories from that publisher, the same way;
+        * anything else (Top Stories, For You, Trending): stories the section carried in the last
+          ``EARLIER_WINDOW``, at most ``EARLIER_MAX``, most recently carried first.
+
+        Only stories the archive has a record for are listed; sponsored stories are left out of the
+        deeper part. Returns the slugs whose lists changed."""
+        now = now or self.clock()
+        changed: List[str] = []
+        with self._lock:
+            cur = self._writer.cursor()
+            current = cur.execute("SELECT slug, kind, tag_id, article_ids, promotional FROM sections "
+                                  "WHERE position IS NOT NULL").fetchall()
+            slugs = set()
+            for row in current:
+                slug = row["slug"]
+                slugs.add(slug)
+                today = [i for i in json.loads(row["article_ids"] or "[]") if isinstance(i, str)]
+                items = [(i, "today") for i in dict.fromkeys(today)]
+                if not row["promotional"]:
+                    items += self._deeper(cur, slug, row["tag_id"], set(today), now)
+                items = items[:SECTION_MAX]
+                old = [(r[0], r[1]) for r in cur.execute(
+                    "SELECT article_id, source FROM section_items WHERE slug = ? ORDER BY position", (slug,))]
+                if old != items:
+                    cur.execute("DELETE FROM section_items WHERE slug = ?", (slug,))
+                    cur.executemany("INSERT INTO section_items VALUES (?, ?, ?, ?)",
+                                    [(slug, n, i, src) for n, (i, src) in enumerate(items)])
+                    changed.append(slug)
+            for (slug,) in cur.execute("SELECT DISTINCT slug FROM section_items").fetchall():
+                if slug not in slugs:
+                    cur.execute("DELETE FROM section_items WHERE slug = ?", (slug,))
+            self._writer.commit()
+        return changed
+
+    def _deeper(self, cur, slug: str, tag_id: Optional[str], seen: Set[str], now: float) -> List[Tuple[str, str]]:
+        window = now - self.section_window
+        oldest = now - DEEP_FALLBACK
+
+        def take(rows, source: str) -> List[Tuple[str, str]]:
+            out: List[Tuple[str, str]] = []
+            clusters: Counter = Counter()
+            for article_id, cluster, published in rows:
+                if article_id in seen:
+                    continue
+                if len(out) >= DEEP_MIN and (published or 0) < window:
+                    break
+                if cluster:
+                    if clusters[cluster] >= PER_CLUSTER:
+                        continue
+                    clusters[cluster] += 1
+                seen.add(article_id)
+                out.append((article_id, source))
+            return out
+
+        if tag_id:
+            rows = cur.execute(
+                """SELECT f.article_id, f.cluster_id, COALESCE(a.published_at, f.published_at) AS t
+                   FROM feed_items f JOIN articles a ON a.id = f.article_id
+                   WHERE f.tag_id = ? AND a.sponsored = 0 AND COALESCE(a.published_at, f.published_at) >= ?
+                   ORDER BY t DESC, f.article_id LIMIT 300""", (tag_id, oldest)).fetchall()
+            found = take(rows, "feed")
+            if found:
+                return found
+            rows = cur.execute(
+                """SELECT id, NULL, published_at FROM articles
+                   WHERE channel_id = ? AND sponsored = 0 AND published_at >= ?
+                   ORDER BY published_at DESC, id LIMIT 300""", (tag_id, oldest)).fetchall()
+            found = take(rows, "channel")
+            if found:
+                return found
+        out: List[Tuple[str, str]] = []
+        for (article_id,) in cur.execute(
+                """SELECT p.article_id FROM placements p JOIN articles a ON a.id = p.article_id
+                   WHERE p.section_slug = ? AND p.last_seen >= ? AND a.sponsored = 0
+                   ORDER BY p.last_seen DESC, p.best_position, p.article_id LIMIT ?""",
+                (slug, now - EARLIER_WINDOW, EARLIER_MAX + len(seen))).fetchall():
+            if article_id not in seen and len(out) < EARLIER_MAX:
+                seen.add(article_id)
+                out.append((article_id, "earlier"))
+        return out
 
     # ----------------------------------------------------------------- jobs
 

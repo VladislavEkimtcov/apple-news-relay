@@ -39,6 +39,8 @@ log = logging.getLogger(__name__)
 
 MAX_LIMIT = 100
 DEFAULT_LIMIT = 20
+SECTION_ALL = 1000
+CLIENT_ID = re.compile(r"^[A-Za-z0-9_-]{3,40}$")
 
 
 # --------------------------------------------------------------------------
@@ -179,13 +181,15 @@ class Request:
 class Response:
     def __init__(self, status: int = 200, payload: Any = None, headers: Optional[Dict[str, str]] = None,
                  content_type: str = "application/json; charset=utf-8", raw: Optional[bytes] = None,
-                 cache: str = "no-cache"):
+                 cache: str = "no-cache", etag: Optional[str] = None):
         self.status = status
         self.payload = payload
         self.headers = dict(headers or {})
         self.content_type = content_type
         self.raw = raw
         self.cache = cache
+        # A validator the handler already knows (so a 304 needs no payload); else one is hashed.
+        self.etag = etag
         self.stream: Optional[Callable[[Callable[[bytes], None]], None]] = None
 
     def body_bytes(self) -> bytes:
@@ -301,6 +305,9 @@ class RelayApp:
         self.cors_origin = cors_origin
         self.started_at = time.time()
         self._entitlement = (0.0, None)
+        self._front_cache: "Dict[str, Tuple[bytes, List[str]]]" = {}
+        self._front_lock = threading.Lock()
+        self._missing_queued: Dict[str, float] = {}
         self.router = Router()
         self._routes()
 
@@ -379,12 +386,14 @@ class RelayApp:
         r("GET", "/v1", self.index, "API index")
         r("GET", "/v1/status", self.status, "Health of the relay, News.app and the cache")
         r("GET", "/v1/stats", self.stats, "Archive statistics")
+        r("GET", "/v1/front", self.front, "A whole front page in one call: sections, Latest, Saved")
         r("GET", "/v1/articles", self.articles, "List articles")
         r("GET", "/v1/articles/{id}", self.article, "Get one article, with its body")
         r("POST", "/v1/articles/{id}/fetch", self.article_fetch, "Ask News to download an article")
         r("GET", "/v1/articles/{id}/related", self.article_related, "Articles related to one article")
         r("GET", "/v1/sections", self.sections, "Today feed sections")
         r("GET", "/v1/sections/{id}", self.section, "One section with its articles in feed order")
+        r("GET", "/v1/sections/{id}/articles", self.section_articles, "A section's stories, page by page, deep")
         r("GET", "/v1/sections/{id}/history", self.section_history, "Every article a section has carried")
         r("POST", "/v1/sections/{id}/refresh", self.section_refresh, "Load more of one section")
         r("POST", "/v1/today/refresh", self.today_refresh, "Refresh the Today feed in News")
@@ -405,6 +414,8 @@ class RelayApp:
         r("GET", "/v1/jobs", self.job_list, "Recent News jobs")
         r("GET", "/v1/jobs/{id}", self.job_get, "One News job")
         r("DELETE", "/v1/jobs/{id}", self.job_cancel, "Cancel a queued job")
+        r("PUT", "/v1/interest/{client}", self.interest_put, "Stories a client is heading for: fetch them ahead")
+        r("DELETE", "/v1/interest/{client}", self.interest_delete, "Forget a client's stories to fetch ahead")
         r("GET", "/v1/events", self.event_stream, "Server-Sent Events")
 
     # ----------------------------------------------------------- handlers
@@ -424,11 +435,16 @@ class RelayApp:
         from .openapi import spec
         return Response(200, spec(self.router.routes), cache="max-age=300")
 
+    #: What this relay can do beyond 0.2 (clients check before using it).
+    FEATURES = ["front", "deep_sections", "partial_bodies", "interest", "events_hello"]
+
     def index(self, req: Request) -> Response:
-        return Response(200, {"name": "apple-news-relay", "version": __version__, "links": {
-            "status": "/v1/status", "stats": "/v1/stats", "articles": "/v1/articles", "sections": "/v1/sections",
+        return Response(200, {"name": "apple-news-relay", "version": __version__, "features": self.FEATURES,
+                              "links": {
+            "status": "/v1/status", "stats": "/v1/stats", "front": "/v1/front", "articles": "/v1/articles",
+            "sections": "/v1/sections",
             "channels": "/v1/channels", "topics": "/v1/topics", "saved": "/v1/saved", "history": "/v1/history",
-            "handoff": "/v1/handoff",
+            "handoff": "/v1/handoff", "interest": "/v1/interest/{client}",
             "search": "/v1/search", "jobs": "/v1/jobs", "events": "/v1/events", "openapi": "/openapi.json"}})
 
     def status(self, req: Request) -> Response:
@@ -448,7 +464,8 @@ class RelayApp:
             "cache": {"readable": cache_ok, "path": self.paths.production},
             "account": {"news_plus": ent.news_plus, "detail": ent.detail},
             "harvester": {"passes": self.harvester.passes, "last": report.to_dict() if report else None},
-            "jobs": {"queued": queued, "running": running},
+            "jobs": {"queued": queued, "running": running, "warming": self.jobs.warming()},
+            "front_version": self.store.front_version,
         })
 
     def stats(self, req: Request) -> Response:
@@ -496,12 +513,14 @@ class RelayApp:
         conn = self.store.read()
         row = self.article_row(conn, req.params["id"])
         fetch = req.choice("fetch", ["auto", "never"], "auto")
+        from_block = req.int("from_block", 0, 0, 100000)
+        max_chars = req.int("max_chars", 0, 0, 1000000)
         job = None
         if not row["has_body"] and fetch == "auto":
             job = self.submit("fetch_article", row["id"], "interactive")
             self.wait_for(job, req)
             row = self.article_row(conn, row["id"])
-        body = Q.article_detail(conn, self.store, row, self.entitled(), self.include_ads(req))
+        body = Q.article_detail(conn, self.store, row, self.entitled(), self.include_ads(req), from_block, max_chars)
         headers = {}
         if job is not None and not job.done.is_set():
             body["fetch_job"] = job.to_dict()
@@ -545,34 +564,57 @@ class RelayApp:
                 if i in known and (include_ads or not known[i]["sponsored"])]
         return page(req, data, None, len(data), missing=[i for i in ids if i not in known])
 
+    def section_item(self, conn, row, per: int, deep: bool, include_ads: bool,
+                     fields: Optional[List[str]] = None) -> dict:
+        """A section and up to ``per`` of its stories: the Today feed's (``deep`` false, as in 0.2)
+        or its full list (Today's first, then more of the same; see ``Store.compose_sections``)."""
+        entitled = self.entitled()
+        item = Q.section_json(row)
+        if deep:
+            items = Q.section_ids(conn, row["slug"]) or [(i, "today") for i in Q.loads(row["article_ids"], [])]
+            item["today_count"] = item["article_count"]
+            item["article_count"] = len(items)
+            item["links"]["articles"] = "/v1/sections/%s/articles" % row["slug"]
+            item["links"]["next"] = None
+            if per:
+                arts, nxt = Q.section_page(conn, row["slug"], items, entitled, include_ads, per, None)
+                item["articles"] = [sparse(a, fields) for a in arts]
+                if nxt:
+                    item["links"]["next"] = item["links"]["articles"] + "?" + urlencode({"limit": per, "cursor": nxt})
+        elif per:
+            ids = Q.loads(row["article_ids"], [])
+            known = Q.get_article_rows(conn, ids)
+            item["articles"] = [sparse(Q.article_summary(known[i], entitled), fields) for i in ids
+                                if i in known and (include_ads or not known[i]["sponsored"])][:per]
+        return item
+
     def sections(self, req: Request) -> Response:
         conn = self.store.read()
         include_ads = self.include_ads(req)
         current = req.bool("current", True)
         sql = "SELECT * FROM sections" + (" WHERE position IS NOT NULL" if current else "") + \
               " ORDER BY position IS NULL, position, title"
-        per = req.int("per_section", 0, 0, 50)
-        data = []
-        for row in conn.execute(sql):
-            if row["promotional"] and not include_ads:
-                continue
-            item = Q.section_json(row)
-            if per:
-                ids = Q.loads(row["article_ids"], [])
-                known = Q.get_article_rows(conn, ids)
-                item["articles"] = [Q.article_summary(known[i], self.entitled()) for i in ids
-                                    if i in known and (include_ads or not known[i]["sponsored"])][:per]
-            data.append(item)
+        per = req.int("per_section", 0, 0, 60)
+        deep = req.bool("deep", False)
+        data = [self.section_item(conn, row, per, deep, include_ads) for row in conn.execute(sql).fetchall()
+                if include_ads or not row["promotional"]]
         return page(req, data, None, len(data))
 
-    def section(self, req: Request) -> Response:
-        conn = self.store.read()
+    def _section_row(self, conn, req: Request):
         row = conn.execute("SELECT * FROM sections WHERE slug = ?", (req.params["id"],)).fetchone()
         if row is None:
             raise not_found("section", req.params["id"])
-        include_ads = self.include_ads(req)
-        if row["promotional"] and not include_ads:
+        if row["promotional"] and not self.include_ads(req):
             raise ApiError(404, "Not found", "That section is promotional; pass ads=include to see it.", slug="not-found")
+        return row
+
+    def section(self, req: Request) -> Response:
+        conn = self.store.read()
+        row = self._section_row(conn, req)
+        include_ads = self.include_ads(req)
+        if req.bool("deep", False):
+            item = self.section_item(conn, row, SECTION_ALL, True, include_ads)
+            return Response(200, {"data": item})
         ids = Q.loads(row["article_ids"], [])
         known = Q.get_article_rows(conn, ids)
         item = Q.section_json(row)
@@ -580,6 +622,77 @@ class RelayApp:
                             if i in known and (include_ads or not known[i]["sponsored"])]
         item["missing_article_ids"] = [i for i in ids if i not in known]
         return Response(200, {"data": item})
+
+    def section_articles(self, req: Request) -> Response:
+        """A section's full story list, a page at a time (the front page carries the first page)."""
+        conn = self.store.read()
+        row = self._section_row(conn, req)
+        limit = req.int("limit", DEFAULT_LIMIT, 1, MAX_LIMIT)
+        items = Q.section_ids(conn, row["slug"]) or [(i, "today") for i in Q.loads(row["article_ids"], [])]
+        try:
+            data, nxt = Q.section_page(conn, row["slug"], items, self.entitled(), self.include_ads(req), limit,
+                                       req.get("cursor"))
+        except (Q.CursorError, ValueError, IndexError) as e:
+            raise bad_param("cursor", str(e) or "cursor is not valid")
+        return page(req, data, nxt, limit, total=len(items))
+
+    def front(self, req: Request) -> Response:
+        """Sections (deep, first page of each), Latest and Saved in one response. The ETag comes
+        from the front version, so an unchanged page is answered 304 without building anything."""
+        per = req.int("per_section", 15, 0, 60)
+        latest_n = req.int("latest", 45, 0, MAX_LIMIT)
+        saved_n = req.int("saved", 45, 0, MAX_LIMIT)
+        fields = req.list("fields")
+        include_ads = self.include_ads(req)
+        fetch_missing = req.bool("fetch_missing", False)
+        entitled = self.entitled()
+        version = self.store.front_version
+        query = sorted((k, v) for k, vs in req.query.items() for v in vs if k != "token")
+        etag = 'W/"front-%d-%d-%s"' % (version, int(entitled),
+                                       hashlib.sha1(json.dumps(query).encode()).hexdigest()[:10])
+        if etag in (req.headers.get("If-None-Match") or ""):
+            return Response(304, etag=etag)
+        with self._front_lock:
+            cached = self._front_cache.get(etag)
+        if cached is None:
+            conn = self.store.read()
+            sections = [self.section_item(conn, row, per, True, include_ads, fields) for row in conn.execute(
+                "SELECT * FROM sections WHERE position IS NOT NULL ORDER BY position, title").fetchall()
+                if include_ads or not row["promotional"]]
+            latest: Dict[str, Any] = {"articles": [], "links": {"next": None}}
+            if latest_n:
+                rows, nxt = Q.list_articles(conn, Q.ArticleFilter(include_ads=include_ads), entitled,
+                                            "-published_at", latest_n, None)
+                latest["articles"] = [sparse(a, fields) for a in self.summaries(rows)]
+                if nxt:
+                    latest["links"]["next"] = "/v1/articles?" + urlencode({"limit": latest_n, "cursor": nxt})
+            saved_data, missing, _ = self._library_rows(conn, "saved", "saved_at", "WHERE removed_at IS NULL",
+                                                        saved_n, 0) if saved_n else ([], [], None)
+            body = {"data": {"version": version, "sections": sections, "latest": latest,
+                             "saved": {"articles": [sparse(a, fields) for a in saved_data],
+                                       "missing_article_ids": missing}}}
+            cached = (json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), missing)
+            with self._front_lock:
+                self._front_cache[etag] = cached
+                while len(self._front_cache) > 4:
+                    self._front_cache.pop(next(iter(self._front_cache)))
+        raw, missing = cached
+        if fetch_missing and missing:
+            self.queue_missing(missing)
+        return Response(200, raw=raw, etag=etag)
+
+    def queue_missing(self, ids: List[str]):
+        """Background fetches for saved stories the relay has no record of; each at most every
+        30 minutes (a story News can't open stays missing)."""
+        now = time.time()
+        for article_id in ids:
+            if not ARTICLE_ID.match(article_id) or now - self._missing_queued.get(article_id, 0) < 1800:
+                continue
+            self._missing_queued[article_id] = now
+            try:
+                self.jobs.submit("fetch_article", article_id, "background")
+            except QueueFull:
+                break
 
     def section_history(self, req: Request) -> Response:
         conn = self.store.read()
@@ -679,15 +792,7 @@ class RelayApp:
             return accepted(job.to_dict()) if not job.done.is_set() else Response(200, {"data": job.to_dict()})
         return handler
 
-    def _library(self, req: Request, table: str, time_col: str, extra_where: str = "") -> Response:
-        conn = self.store.read()
-        limit = req.int("limit", DEFAULT_LIMIT, 1, MAX_LIMIT)
-        offset = 0
-        if req.get("cursor"):
-            try:
-                offset = int(Q.decode_cursor(req.get("cursor") or "")[1])
-            except (Q.CursorError, IndexError, ValueError):
-                raise bad_param("cursor", "cursor is not valid")
+    def _library_rows(self, conn, table: str, time_col: str, extra_where: str, limit: int, offset: int):
         rows = conn.execute("SELECT article_id, %s FROM %s %s ORDER BY %s DESC LIMIT ? OFFSET ?"
                             % (time_col, table, extra_where, time_col), (limit + 1, offset)).fetchall()
         nxt = Q.encode_cursor([table, offset + limit]) if len(rows) > limit else None
@@ -701,14 +806,21 @@ class RelayApp:
                 data.append(item)
             else:
                 missing.append(article_id)
+        return data, missing, nxt
+
+    def _library(self, req: Request, table: str, time_col: str, extra_where: str = "") -> Response:
+        conn = self.store.read()
+        limit = req.int("limit", DEFAULT_LIMIT, 1, MAX_LIMIT)
+        offset = 0
+        if req.get("cursor"):
+            try:
+                offset = int(Q.decode_cursor(req.get("cursor") or "")[1])
+            except (Q.CursorError, IndexError, ValueError):
+                raise bad_param("cursor", "cursor is not valid")
+        data, missing, nxt = self._library_rows(conn, table, time_col, extra_where, limit, offset)
         if missing and req.bool("fetch_missing", False):
             # Prefetching: behind anything someone is waiting for, and never an error here.
-            for article_id in missing:
-                if ARTICLE_ID.match(article_id):
-                    try:
-                        self.jobs.submit("fetch_article", article_id, "background")
-                    except QueueFull:
-                        break
+            self.queue_missing(missing)
         return page(req, data, nxt, limit, missing_article_ids=missing)
 
     def saved(self, req: Request) -> Response:
@@ -801,6 +913,26 @@ class RelayApp:
         self.jobs.cancel(job.id)
         return Response(200, {"data": job.to_dict()})
 
+    def interest_put(self, req: Request) -> Response:
+        """The stories a client may open next, most likely first (at most 12). The relay has News
+        fetch the ones it lacks, in that order, in the background; a newer list from the same
+        client replaces this one, and fetches nobody wants any more are dropped."""
+        client = req.params["client"]
+        if not CLIENT_ID.match(client):
+            raise bad_param("client", "3-40 letters, digits, - or _")
+        ids = req.json().get("articles")
+        if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+            raise bad_param("articles", "a list of article ids")
+        states = self.jobs.set_interest(client, [i for i in ids if ARTICLE_ID.match(i)])
+        return Response(200, {"data": {"client": client, "articles": states}})
+
+    def interest_delete(self, req: Request) -> Response:
+        client = req.params["client"]
+        if not CLIENT_ID.match(client):
+            raise bad_param("client", "3-40 letters, digits, - or _")
+        self.jobs.set_interest(client, [])
+        return Response(204)
+
     def event_stream(self, req: Request) -> Response:
         resp = Response(200, content_type="text/event-stream; charset=utf-8", cache="no-store")
         hub = self.events
@@ -809,6 +941,10 @@ class RelayApp:
             q = hub.subscribe()
             try:
                 write(b"retry: 5000\n\n")
+                # Where things stand, so a client that reconnects knows whether it missed a change.
+                write(("event: hello\ndata: %s\n\n" % json.dumps({
+                    "version": __version__, "front_version": self.store.front_version,
+                    "features": self.FEATURES})).encode())
                 while True:
                     try:
                         kind, data = q.get(timeout=15)
@@ -861,6 +997,9 @@ def make_handler(app: RelayApp):
     class RelayHandler(BaseHTTPRequestHandler):
         server_version = "apple-news-relay/" + __version__
         protocol_version = "HTTP/1.1"
+        # An idle kept-alive connection is closed after this; longer than clients keep one idle
+        # (.NET: 100 s, Android: 5 s), so they never write into a closed one.
+        timeout = 120
 
         def _serve(self):
             started = time.time()
@@ -898,9 +1037,13 @@ def make_handler(app: RelayApp):
                     pass
                 self.close_connection = True
                 return
-            payload = resp.body_bytes()
             status = resp.status
-            if status == 200 and payload:
+            payload = b"" if status == 304 else resp.body_bytes()
+            if resp.etag and status in (200, 304):
+                headers["ETag"] = resp.etag
+                if status == 200 and resp.etag in (self.headers.get("If-None-Match") or ""):
+                    status, payload = 304, b""
+            elif status == 200 and payload:
                 etag = 'W/"%s"' % hashlib.sha1(payload).hexdigest()[:20]
                 headers["ETag"] = etag
                 if etag in (self.headers.get("If-None-Match") or ""):

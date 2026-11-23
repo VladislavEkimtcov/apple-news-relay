@@ -26,11 +26,13 @@ from .store import Store, default_path
 
 
 def build(args) -> RelayApp:
-    store = Store(args.db)
+    store = Store(args.db, section_window=getattr(args, "section_window_hours", 48.0) * 3600)
     events = EventHub()
     paths = NewsPaths()
     harvester = Harvester(store, paths, on_event=events.publish)
-    jobs = JobRunner(store, harvester, NewsApp(), on_event=events.publish)
+    jobs = JobRunner(store, harvester, NewsApp(), on_event=events.publish,
+                     warm_gap=getattr(args, "warm_gap", 0.6),
+                     pause_warm_in_front=getattr(args, "pause_warm_when_news_in_front", False))
     allow = [a for a in (args.allow or "").split(",") if a]
     handoff = None if getattr(args, "no_handoff", True) else Handoff(store, jobs.app, jobs, on_event=events.publish)
     return RelayApp(store, harvester, jobs, paths, events, token=args.token or os.environ.get("NEWS_RELAY_TOKEN"),
@@ -130,6 +132,12 @@ def main(argv=None) -> int:
     p.add_argument("--no-bonjour", action="store_true", help="don't advertise _newsrelay._tcp on the LAN")
     p.add_argument("--no-handoff", action="store_true",
                    help="don't watch which story News shows on this Mac (GET /v1/handoff stays empty)")
+    p.add_argument("--warm-gap", type=float, default=0.6,
+                   help="seconds between background story fetches that clients asked for ahead (default 0.6)")
+    p.add_argument("--pause-warm-when-news-in-front", action="store_true",
+                   help="hold background story fetches while News is the app in front on this Mac")
+    p.add_argument("--section-window-hours", type=float, default=48.0,
+                   help="how far back a section reaches into its topic's or publisher's feed (default 48)")
     p.set_defaults(func=cmd_serve)
     sub.add_parser("harvest", help="harvest once and print a report").set_defaults(func=cmd_harvest)
     sub.add_parser("doctor", help="check access to News and its cache").set_defaults(func=cmd_doctor)

@@ -67,6 +67,11 @@ class NewsPaths:
         return os.path.join(self.production, "today-feed-db")
 
     @property
+    def feed_db(self) -> str:
+        """Per-channel and per-topic feeds (SQLite): every story News has listed for a tag."""
+        return os.path.join(self.production, "feeddatabase")
+
+    @property
     def reading_list(self) -> str:
         return os.path.join(self.private, "reading-list")
 
@@ -438,6 +443,112 @@ def read_sections(paths: NewsPaths) -> List[Section]:
             out.append(Section(gid, kind_id or "", section_title(kind_id or gid), group_type or "", tag_id,
                                g_created, [i for i in ids if isinstance(i, str)]))
     return out
+
+
+# --------------------------------------------------------------------------
+# Channel and topic feeds
+# --------------------------------------------------------------------------
+
+@dataclass
+class FeedItem:
+    """One story in a channel's or topic's feed (``feeddatabase``).
+
+    The Today feed shows three or four stories of a topic; this feed holds every story News has
+    listed for it (hundreds for a busy topic)."""
+
+    feed_id: str                 # "<tag id>$en-US", "<tag id>@A$en-US", "<tag id>@B$en-US", "<tag id>#P$en-US"
+    tag_id: str
+    article_id: str
+    order: Optional[int]         # field 2: the feed's order key (milliseconds)
+    published_at: Optional[float]  # field 3: publication time in ms (matches the record for most stories)
+    cluster_id: Optional[str]    # field 6: inferred, one id for the same story told by several publishers
+    channel_id: Optional[str]    # field 7: the publisher
+    topic_ids: List[str]         # field 13: tags News filed the story under (most aren't in the tag records)
+
+
+def feed_tag(feed_id: str) -> str:
+    """``Tb9WRxMTPRsyCnsQuo1AG8g@B$en-US`` -> ``Tb9WRxMTPRsyCnsQuo1AG8g``."""
+    return re.split(r"[@#$]", feed_id, 1)[0]
+
+
+def parse_feed_item(blob: bytes) -> Optional[FeedItem]:
+    """``feed_item.encoded``: ``[0x02][length varint][feed id]`` followed by a protobuf message."""
+    if not blob or len(blob) < 3 or blob[0] != 2:
+        return None
+    try:
+        key_len, start = read_varint(blob, 1)
+        feed_id = bytes(blob[start:start + key_len]).decode("utf-8")
+        m = Message(bytes(blob[start + key_len:]))
+    except (DecodeError, UnicodeDecodeError):
+        return None
+    article_id = m.string(1)
+    if not article_id or not article_id.startswith("A") or not feed_id.startswith("T"):
+        return None
+    published = m.int(3)
+    return FeedItem(feed_id, feed_tag(feed_id), article_id, m.int(2),
+                    published / 1000.0 if published else None, m.string(6), m.string(7),
+                    [t for t in m.strings(13) if t.startswith("T")])
+
+
+def _feed_conn(paths: NewsPaths) -> Optional[sqlite3.Connection]:
+    db = paths.feed_db
+    if not os.path.exists(db):
+        return None
+    return sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=5)
+
+
+def read_feed_states(paths: NewsPaths) -> Dict[str, str]:
+    """``{feed id: signature}`` for every channel and topic feed. The signature changes when News
+    refreshes the feed or loads more of it, so only changed feeds need reading again."""
+    conn = _feed_conn(paths)
+    if conn is None:
+        return {}
+    try:
+        rows = conn.execute("SELECT feed_id, lookup_id, refreshed_from_order, refreshed_to_order, fetched_ranges "
+                            "FROM feed").fetchall()
+    except sqlite3.Error:
+        return {}
+    finally:
+        conn.close()
+    out = {}
+    for feed_id, lookup, frm, to, ranges in rows:
+        if isinstance(feed_id, str) and feed_id.startswith("T"):
+            out[feed_id] = "%s:%s:%s:%s" % (lookup, frm, to, bytes(ranges or b"").hex())
+    return out
+
+
+def read_tag_feeds(paths: NewsPaths, tag_ids: Optional[List[str]] = None) -> Iterator[FeedItem]:
+    """Stories in the feeds of ``tag_ids`` (all feeds when None). Damaged items are skipped.
+
+    Items carry no index on their tag, so a lookup is one pass over the table (about 0.1 s for
+    40,000 items); the tag ids are matched on the raw bytes, then checked after parsing."""
+    conn = _feed_conn(paths)
+    if conn is None:
+        return
+    try:
+        if tag_ids is None:
+            for (blob,) in conn.execute("SELECT encoded FROM feed_item"):
+                item = parse_feed_item(blob)
+                if item:
+                    yield item
+            return
+        wanted = set(tag_ids)
+        by_length: Dict[int, List[bytes]] = {}
+        for t in wanted:
+            by_length.setdefault(len(t.encode()), []).append(t.encode())
+        for length, keys in by_length.items():
+            for i in range(0, len(keys), 400):
+                chunk = keys[i:i + 400]
+                sql = "SELECT encoded FROM feed_item WHERE substr(encoded, 3, %d) IN (%s)" % (
+                    length, ",".join("?" * len(chunk)))
+                for (blob,) in conn.execute(sql, chunk):
+                    item = parse_feed_item(blob)
+                    if item and item.tag_id in wanted:
+                        yield item
+    except sqlite3.Error:
+        return
+    finally:
+        conn.close()
 
 
 # --------------------------------------------------------------------------

@@ -94,6 +94,42 @@ JSON array of article ids, in order). `blobs` holds each group's layout program 
 The current feed is the groups of the newest cursor that has groups. `engagement` groups
 (`SMARTER_MESSAGING`) are Apple News+ upsell slots.
 
+## Channel and topic feeds (`feeddatabase`)
+
+A SQLite file (WAL) with every story News has listed for a channel or topic, far more than the
+Today feed shows (the Today feed had 3 Tech stories while this file listed 1,797, 174 of them
+published that day).
+
+| table | |
+|---|---|
+| `feed` | `feed_id` (text, primary key), `lookup_id`, `refreshed_from_order`, `refreshed_to_order`, `fetched_ranges` (blob) |
+| `feed_item_lookup` | `feed_lookup_id` → `feed.lookup_id`, `feed_item_order`, `feature` (doesn't join to `feed_item`) |
+| `feed_item` | `id`, `encoded` (blob) |
+| `metadata` | empty |
+
+Feed ids are `<tag id>$en-US`, with variants `<tag id>@A$en-US`, `<tag id>@B$en-US` (the one News
+keeps refreshing), `<tag id>#P$en-US` and `<tag id>#P@A$en-US`. A feed's `refreshed_*_order`
+and `fetched_ranges` change when News refreshes or extends it, which is how the relay reads again
+only the feeds that changed. Items have no index on their tag; the relay matches the tag id on the
+raw bytes (`substr(encoded, 3, 23)`) and checks it after parsing: one pass over the table, about
+0.1 s for 44,000 items. Parsing them all takes about 4 s (done once, on the first run).
+
+`encoded`: `02`, a varint length, the feed id, then a protobuf message:
+
+| field | meaning |
+|---|---|
+| 1 | article id |
+| 2 | the feed's order key (milliseconds, a little after publication) |
+| 3 | publication time, milliseconds (matches the article record for most stories) |
+| 4 | constant per feed, meaning unknown (*inferred*: `23400000`, `50400000`) |
+| 5 | a double, meaning unknown |
+| 6 | a `C…` id shared by the same story told by several publishers (*inferred*) |
+| 7 | the publisher's channel id |
+| 13 | repeated tag ids the story is filed under; most have no tag record (33,000 distinct, 1,200 known) |
+
+The relay links a story to the feed's tag, its publisher, and those field-13 tags it has records
+for (`article_tags`), which is what `/v1/topics/{id}/articles` reads.
+
 ## Article bodies (Apple News Format)
 
 Bodies are standard [Apple News Format](https://developer.apple.com/documentation/apple_news/apple_news_format)

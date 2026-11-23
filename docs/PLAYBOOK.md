@@ -47,8 +47,10 @@ storefront, no Apple News+), first by hand while watching the screen, then by
   page-scroll, type a search. A story action presses its menu item only once the Window menu
   names the requested story, and only when that changes something. No clicks at coordinates, so never on ads, "Subscribe", "Get Started" or "Start
   Reading" (which begin a purchase).
-- One action at a time, at least 1.5 s apart; identical requests are merged; a story that won't
-  open isn't retried for 6 hours.
+- One action at a time: 0.25 s after the last when someone is waiting, 0.6 s when fetching
+  stories a client is heading for (at most 12 per client; a newer list replaces the older, and a
+  background fetch gives up after 8 s), 1.5 s for refreshes and channel opens. Identical requests
+  are merged; a story that won't open isn't retried for 6 hours.
 - Focus goes back to whatever app was in front.
 
 ## Eviction
@@ -93,3 +95,20 @@ What it says:
   window). Clients should poll the job rather than rely on `wait` for big refreshes.
 - **Search adds little**: ~2 new stories, most results were already archived.
 - **Idling adds nothing**: News doesn't refresh in the background while it isn't in front.
+
+## Warming run (relay 0.3.0)
+
+Three interest lists of 10 stories each (30 stories with no body, from the deep sections),
+2026-11-23 15:56, News in the background on another Space:
+
+```
+captured           30 of 30, none timed out, all done in 40 s
+fetch (open→body)  median 0.4 s, p90 1.3 s, max 4.9 s
+start to start     median 1.0 s (0.6 s gap + the fetch), max 5.5 s
+News footprint     169 MB before, ~840 MB after, still ~840 MB three minutes later
+```
+
+The footprint grows with how many stories News opens, not with the gap; on a 32 GB Mac with 43%
+free it didn't matter. Real interest lists are shorter (12 at most per client, each replacing the
+last), so a burst like this is the worst case. If News ever feels heavy, `--warm-gap 1.0` spaces
+the fetches out.

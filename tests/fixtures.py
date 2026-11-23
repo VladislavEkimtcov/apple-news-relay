@@ -103,6 +103,7 @@ class FakeNews:
         os.makedirs(self.paths.group)
         self.articles: Dict[str, bytes] = {}
         self.tags: Dict[str, bytes] = {}
+        self.feeds: Dict[str, tuple] = {}
         self.write_entitlement(False)
 
     def close(self):
@@ -161,6 +162,47 @@ class FakeNews:
             conn.execute("INSERT OR REPLACE INTO groups VALUES (?, ?, ?, ?, ?, ?, ?)",
                          (g.get("id", "g%d" % i), g["kindId"], g.get("kind", "curated"), g.get("tagId"),
                           created + i, cursor, json.dumps(g["items"])))
+        conn.commit()
+        conn.close()
+        self._touch_later(db)
+
+    def set_tag_feed(self, tag_id: str, stories: List[dict], variant: str = "@B", refreshed: Optional[int] = None):
+        """News's feed of a channel or topic (``feeddatabase``). ``stories``: dicts with ``id`` and
+        optionally ``published``, ``cluster``, ``channel``, ``topics``."""
+        feed_id = "%s%s$en-US" % (tag_id, variant)
+        n = len(self.feeds.get(feed_id, ([], 0))[0])
+        self.feeds[feed_id] = (stories, refreshed if refreshed is not None else int(NOW * 1000) + n + len(stories))
+        self.write_feeddb()
+
+    def write_feeddb(self, damaged: bool = False):
+        db = self.paths.feed_db
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            DROP TABLE IF EXISTS metadata; DROP TABLE IF EXISTS feed; DROP TABLE IF EXISTS feed_item_lookup;
+            DROP TABLE IF EXISTS feed_item;
+            CREATE TABLE metadata (last_feed_lookup_id INTEGER, last_feed_item_id INTEGER);
+            CREATE TABLE feed (feed_id STRING PRIMARY KEY, lookup_id INTEGER, refreshed_from_order INTEGER,
+                refreshed_to_order INTEGER, fetched_ranges BLOB);
+            CREATE TABLE feed_item_lookup (feed_lookup_id INTEGER, feed_item_order INTEGER, feature INTEGER);
+            CREATE TABLE feed_item (id INTEGER PRIMARY KEY, encoded BLOB);""")
+        item_id = 1000
+        for lookup, (feed_id, (stories, refreshed)) in enumerate(sorted(self.feeds.items()), start=1):
+            conn.execute("INSERT INTO feed VALUES (?, ?, ?, ?, ?)",
+                         (feed_id, lookup, refreshed, refreshed - 1000, b"\x01\x02" + str(refreshed).encode()))
+            for s in stories:
+                published = s.get("published", NOW)
+                order = int(published * 1000) + 7
+                msg = F(1, s["id"]) + F(2, order) + F(3, int(published * 1000)) + F(4, 23400000) + F(5, 0.5)
+                msg += F(6, s.get("cluster")) + F(7, s.get("channel")) + F(8, 1)
+                for t in s.get("topics", ()):
+                    msg += F(13, t)
+                key = feed_id.encode()
+                blob = b"\x02" + encode_varint(len(key)) + key + msg
+                item_id += 1
+                conn.execute("INSERT INTO feed_item VALUES (?, ?)", (item_id, blob))
+                conn.execute("INSERT INTO feed_item_lookup VALUES (?, ?, ?)", (lookup, order, item_id * 7919))
+        if damaged:
+            conn.execute("INSERT INTO feed_item VALUES (?, ?)", (item_id + 1, b"\x02\x05Tbad\xff\xff\xff"))
         conn.commit()
         conn.close()
         self._touch_later(db)

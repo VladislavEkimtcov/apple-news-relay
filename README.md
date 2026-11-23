@@ -84,11 +84,13 @@ All responses are JSON. Collections look like this:
 
 | Endpoint | What |
 |---|---|
-| `GET /v1/sections?per_section=10` | Today's sections in feed order (Top Stories, For You, Trending, topic and channel groups) with their stories |
-| `GET /v1/sections/{id}` · `/history` | one section in order; every story it has carried, with best position and first/last seen |
+| `GET /v1/front` | a whole front page in one call: every section (deep, first page), Latest and Saved; `304` until something on it changes |
+| `GET /v1/sections?per_section=10` | Today's sections in feed order (Top Stories, For You, Trending, topic and channel groups) with their stories; `deep=true` adds more from each topic's or publisher's own feed |
+| `GET /v1/sections/{id}` · `/articles` · `/history` | one section in order; its full (deep) list page by page; every story it has carried, with best position and first/last seen |
 | `GET /v1/articles` | the archive: filter by `channel`, `topic`, `section`, `q`, `since`/`until`, `access`, `completeness`, `format`, `language`, `saved`; `sort`, `limit`, `cursor`, `fields`, `count` |
-| `GET /v1/articles/{id}` | one story with its body as blocks; fetches the body from News if needed (`wait=` seconds to block) |
+| `GET /v1/articles/{id}` | one story with its body as blocks; fetches the body from News if needed (`wait=` seconds to block); `max_chars=` for the opening only, `from_block=` for the rest |
 | `POST /v1/articles/{id}/fetch` | ask News to download a story |
+| `PUT /v1/interest/{client}` | `{"articles": [...]}`: the stories a reader is heading for; News fetches them ahead, and a newer list replaces the older |
 | `GET /v1/articles/{id}/related` | related stories News lists for it |
 | `GET /v1/channels` · `/v1/topics` | publishers and topics, with article counts; `/{id}`, `/{id}/articles`, `POST /{id}/refresh` |
 | `GET /v1/saved` · `/v1/history` | Saved Stories and reading history |
@@ -99,7 +101,7 @@ All responses are JSON. Collections look like this:
 | `POST /v1/searches` `{"query": "…"}` | run the search in News itself, archiving what it finds |
 | `POST /v1/today/refresh?pages=8` | refresh Today in News and scroll it to load more |
 | `GET /v1/jobs/{id}?wait=30` | follow a News job; `DELETE` cancels a queued one |
-| `GET /v1/events` | Server-Sent Events: `articles.added`, `article.body_captured`, `sections.updated`, `saved.updated`, `handoff.updated`, `job.updated` |
+| `GET /v1/events` | Server-Sent Events: `hello`, `front.updated`, `articles.added`, `article.body_captured`, `sections.updated`, `saved.updated`, `handoff.updated`, `job.updated` |
 | `GET /v1/status` · `/v1/stats` | health, account, harvester; archive statistics |
 
 An article body is a list of blocks a client can render without knowing anything about Apple
