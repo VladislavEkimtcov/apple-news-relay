@@ -14,6 +14,7 @@ storefront, no Apple News+), first by hand while watching the screen, then by
 | Refresh Today | AX: press "Today" in the sidebar, menu View › Check for New Stories | a new feed cursor; For You and other groups rebuilt; **old records pruned** (1,251 → 734 in one refresh) | 20–30 s | stays |
 | Scroll Today | AX: `AXScrollDownByPage` on an element of the feed, N times | more groups (topic, channel, magazine), records and bodies: 12 pages gave +418 records, +50 bodies | ~1 s a page | **News comes forward**; the relay puts the previous app back |
 | Search | keystrokes: ⌘F, ⌘A, query, Return | records for the results, bodies of the first 8 results, matching topics and channels | ~6 s | needs News in front for a moment |
+| Save, like, dislike a story | open it, then menu File › Save Story / Unsave Story, Suggest More / Fewer Stories Like This | the change itself (Saved Stories syncs through iCloud) | 2.2–2.4 s | stays |
 | Nothing | — | News refreshes on its own when it's in front; the cache shrinks over time | — | — |
 
 ## Things that don't work
@@ -26,11 +27,21 @@ storefront, no Apple News+), first by hand while watching the screen, then by
   (by description: "Today", "Saved Stories", …) and every story card (description: publisher,
   "Apple News Plus", headline, age). Coordinates aren't needed.
 - Right after a story or channel opens, News may briefly have no window; scripts wait for one.
+- While someone works on the Mac with News on another Space, System Events lists **no** News
+  windows at all, so the feed can't be pressed or scrolled; the menu bar still works. A Today
+  refresh then only clicks Check for New Stories (`feed_reached: false` in its result).
+- The menus work without a window and without News in front: News's **Window menu lists each
+  window's title** ("<headline> - <publisher>" for a story), which is how a story action checks
+  that News shows the right story before pressing anything. In the File menu, Save Story turns
+  into Unsave Story once a story is saved, and Suggest More / Fewer Stories Like This carry a
+  check mark (`AXMenuItemMarkChar` "✓") when set; they exclude each other, and pressing a checked
+  one again clears it.
 
 ## Safety rules the relay follows
 
-- Only fixed actions: open by validated id, press "Today", one menu item, page-scroll, type a
-  search. No clicks at coordinates, so never on ads, "Subscribe", "Get Started" or "Start
+- Only fixed actions: open by validated id, press "Today", one menu item from a fixed list,
+  page-scroll, type a search. A story action presses its menu item only once the Window menu
+  names the requested story, and only when that changes something. No clicks at coordinates, so never on ads, "Subscribe", "Get Started" or "Start
   Reading" (which begin a purchase).
 - One action at a time, at least 1.5 s apart; identical requests are merged; a story that won't
   open isn't retried for 6 hours.

@@ -56,6 +56,19 @@ OPERATIONS: Dict[str, Dict[str, dict]] = {
                                    "responses": {"200": _json(_data(_ref("Job"))), "202": ACCEPTED, "429": PROBLEM}}},
     "/v1/saved": {"get": {"parameters": [_param("limit"), _param("cursor"), {"name": "fetch_missing", "in": "query", "schema": {"type": "boolean"}}],
                           "responses": {"200": _json(_page_of("Article"))}}},
+    "/v1/saved/{id}": {m: {"parameters": [_param("id"), _param("wait")],
+                           "responses": {"200": _json(_data(_ref("Job"))), "202": ACCEPTED, "404": PROBLEM, "429": PROBLEM}}
+                       for m in ("put", "delete")},
+    "/v1/articles/{id}/reaction": {
+        "put": {"parameters": [_param("id"), _param("wait")], "requestBody": {"content": {"application/json": {"schema": {
+            "type": "object", "required": ["reaction"], "properties": {"reaction": {"type": "string", "enum": ["like", "dislike"]}}}}}},
+            "responses": {"200": _json(_data(_ref("Job"))), "202": ACCEPTED, "400": PROBLEM, "404": PROBLEM}},
+        "delete": {"parameters": [_param("id"), _param("wait")],
+                   "responses": {"200": _json(_data(_ref("Job"))), "202": ACCEPTED, "404": PROBLEM}}},
+    "/v1/handoff": {"get": {"responses": {"200": _json({"type": "object", "properties": {"data": {"oneOf": [
+        {"type": "null"}, {"type": "object", "properties": {
+            "article": _ref("Article"), "on_screen": {"type": "boolean", "description": "News is in front showing it now"},
+            "since": {"type": "string", "format": "date-time"}, "seen_at": {"type": "string", "format": "date-time"}}}]}}})}}},
     "/v1/history": {"get": {"parameters": [_param("limit"), _param("cursor")], "responses": {"200": _json(_page_of("Article"))}}},
     "/v1/search": {"get": {"parameters": [{"name": "q", "in": "query", "required": True, "schema": {"type": "string"}},
                                           _param("limit"), _param("cursor"), _param("ads"), _param("fields")],
@@ -68,7 +81,7 @@ OPERATIONS: Dict[str, Dict[str, dict]] = {
     "/v1/jobs/{id}": {"get": {"parameters": [_param("id"), _param("wait")], "responses": {"200": _json(_data(_ref("Job"))), "404": PROBLEM}},
                       "delete": {"parameters": [_param("id")], "responses": {"200": _json(_data(_ref("Job"))), "409": PROBLEM}}},
     "/v1/events": {"get": {"responses": {"200": {"description": "text/event-stream of articles.added, article.body_captured, "
-                                                 "sections.updated, saved.updated and job.updated events",
+                                                 "sections.updated, saved.updated, handoff.updated and job.updated events",
                                                  "content": {"text/event-stream": {"schema": {"type": "string"}}}}}}},
 }
 
@@ -119,6 +132,7 @@ BLOCK = {"type": "object", "required": ["type"], "properties": {
     "text": {"type": "string"}, "level": {"type": "integer"}, "url": {"type": "string"},
     "width": {"type": ["integer", "null"]}, "height": {"type": ["integer", "null"]}, "caption": {"type": "string"},
     "images": {"type": "array", "items": {"type": "object"}}, "poster": {"type": ["string", "null"]},
+    "aspect_ratio": {"type": "number", "description": "video and audio: width / height"},
     "provider": {"type": "string"}, "links": {"type": "array", "items": {"type": "string"}}}}
 
 SCHEMAS = {
@@ -146,7 +160,10 @@ SCHEMAS = {
         "reading_minutes": {"type": ["integer", "null"]}, "colors": {"type": "object"}, "links": {"type": "object"}}},
     "ArticleDetail": {"allOf": [_ref("Article"), {"type": "object", "properties": {
         "topics": {"type": "array", "items": {"type": "object"}}, "related_ids": {"type": "array", "items": {"type": "string"}},
-        "saved_at": {"type": ["string", "null"]}, "placements": {"type": "array", "items": _ref("Placement")},
+        "saved": {"type": "boolean"}, "saved_at": {"type": ["string", "null"]},
+        "reaction": {"type": ["string", "null"], "enum": ["like", "dislike", None],
+                     "description": "Suggest More (like) or Fewer (dislike) Stories Like This, as set through the relay"},
+        "placements": {"type": "array", "items": _ref("Placement")},
         "body": {"type": ["object", "null"], "properties": {"blocks": {"type": "array", "items": _ref("Block")},
                  "subtitle": {"type": ["string", "null"]}, "byline": {"type": ["string", "null"]},
                  "word_count": {"type": "integer"}, "truncated": {"type": "boolean"}, "removed": {"type": "object"}}},
@@ -161,7 +178,7 @@ SCHEMAS = {
     "Tag": {"type": "object", "properties": {"id": {"type": "string"}, "type": {"type": "string", "enum": ["channel", "topic", "section"]},
             "name": {"type": "string"}, "logo": {"type": ["string", "null"]}, "article_count": {"type": "integer"}}},
     "Job": {"type": "object", "properties": {"id": {"type": "string"}, "kind": {"type": "string",
-            "enum": ["fetch_article", "open_tag", "refresh_today", "search"]}, "target": {"type": ["string", "null"]},
+            "enum": ["fetch_article", "open_tag", "refresh_today", "search", "story_action"]}, "target": {"type": ["string", "null"]},
             "state": {"type": "string", "enum": ["queued", "running", "succeeded", "failed", "cancelled"]},
             "priority": {"type": "string", "enum": ["interactive", "normal", "background"]},
             "result": {"type": ["object", "null"]}, "error": {"type": ["string", "null"]}}},

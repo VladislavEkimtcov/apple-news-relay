@@ -148,8 +148,49 @@ class AnfTest(unittest.TestCase):
 
 
 
+class VideoTest(unittest.TestCase):
+    DOC = {"resources": {
+        "VideoResourceRef-1": {"URL": "https://cdn.example/v/index.m3u8", "classification": "video", "type": "video"},
+        "img": {"URL": "https://cdn.example/still.jpg", "imageIdentifier": "still1", "type": "image",
+                "dimensions": {"width": 1600, "height": 900}}},
+        "components": [
+            {"role": "video", "resourceIdentifier": "VideoResourceRef-1", "stillImageIdentifier": "still1",
+             "caption": "Storms on the coast", "conditional": [{"hidden": False}], "hidden": True},
+            {"role": "video", "resourceIdentifier": "VideoResourceRef-1", "stillImageIdentifier": "still1",
+             "caption": "Storms on the coast", "conditional": [{"hidden": False}], "hidden": True},
+            {"role": "body", "text": "Text."},
+            {"role": "video", "URL": "https://cdn.example/b.mp4", "aspectRatio": 1.7778},
+            {"role": "video", "URL": "https://cdn.example/hidden.mp4", "hidden": True}]}
+
+    def test_stream_poster_caption_once(self):
+        videos = [b for b in anf.convert(self.DOC).blocks if b["type"] == "video"]
+        self.assertEqual(len(videos), 2)
+        self.assertEqual(videos[0], {"type": "video", "url": "https://cdn.example/v/index.m3u8",
+                                     "poster": "https://cdn.example/still.jpg", "caption": "Storms on the coast",
+                                     "aspect_ratio": 1.7778})
+        self.assertEqual(videos[1]["url"], "https://cdn.example/b.mp4")
+        self.assertIsNone(videos[1]["poster"])
+
+
+class StoryStateTest(unittest.TestCase):
+    def test_reads_menu(self):
+        from apple_news_relay.actuator import StoryState
+        st = StoryState.parse({"file": {"Unsave Story": [True, ""], "Save Story": [False, ""],
+                                        "Suggest Fewer Stories Like This": [True, "\u2713"]},
+                               "windows": ["Fed\u2019s  rate call looms - Reuters"]})
+        self.assertEqual((st.saved, st.reaction), (True, "dislike"))
+        self.assertTrue(st.shows(["Fed's rate call looms"]))
+        self.assertFalse(st.shows(["Another headline entirely"]))
+        self.assertFalse(st.shows(["Fed's rate"]), "a shorter headline is another story")
+        self.assertIsNone(StoryState.parse({"file": {"Save Story": [False, ""]}, "windows": []}).saved)
+
+
 class BylineTest(unittest.TestCase):
     def test_names_only(self):
+        self.assertIsNone(anf.clean_byline("Published on November 23, 2026", "FOX Weather"))
+        self.assertEqual(anf.clean_byline("Updated 9:41 AM by Jane Doe", "X"), "Jane Doe")
+        self.assertEqual(anf.clean_byline("Sudiksha Kochi - 11/23/26 06:00 AM EST", "The Hill"), "Sudiksha Kochi")
+        self.assertEqual(anf.clean_byline("By Al Roe | November 23, 2026 | Reuters", "Reuters"), "Al Roe")
         from apple_news_relay.anf import clean_byline
         self.assertEqual(clean_byline("by Dennis Romero | NBC NEWS", "NBC News"), "Dennis Romero")
         self.assertEqual(clean_byline("By Ana Ruiz and Bo Li", "The Daily Example"), "Ana Ruiz and Bo Li")

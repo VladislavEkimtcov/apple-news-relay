@@ -10,16 +10,21 @@ open_tag           ``open -g applenewss://apple.news/<tag id>``      ~50 records
 refresh_today      Accessibility: press "Today", menu View > Check  new feed cursor; page scrolls load more
                    for New Stories, scroll N pages                  sections, records and bodies
 search             keystrokes: Cmd-F, Cmd-A, query, Return          result records + bodies of the first 8
+story_action       open the story (as fetch_article), check the     Save/Unsave Story, Suggest More/Fewer
+                   Window menu names it, then one File menu item    Stories Like This; ~3-6 s, background
 =================  ===============================================  =======================================
 
 Only these fixed actions exist; identifiers are validated before they reach
 a command line, and nothing ever clicks inside story content, so ads,
-"Subscribe" and purchase buttons are never touched. One job runs at a time.
+"Subscribe" and purchase buttons are never touched. A story action clicks a
+File menu item only once News's Window menu shows that very story. One job
+runs at a time.
 """
 
 from __future__ import annotations
 
 import itertools
+import json
 import logging
 import queue
 import re
@@ -65,6 +70,74 @@ class ActuatorError(RuntimeError):
     pass
 
 
+#: What a story action does: the File menu item to press, and the state it leads to.
+STORY_ACTIONS = {
+    "save": ("Save Story", "saved", True),
+    "unsave": ("Unsave Story", "saved", False),
+    "like": ("Suggest More Stories Like This", "reaction", "like"),
+    "dislike": ("Suggest Fewer Stories Like This", "reaction", "dislike"),
+    "clear_reaction": (None, "reaction", None),
+}
+
+STORY_STATE_JS = r"""
+const p = Application("System Events").processes.byName("News");
+const mb = p.menuBars[0];
+const items = mb.menuBarItems.byName("File").menus[0].menuItems;
+const names = items.name(), enabled = items.enabled(), file = {};
+for (let i = 0; i < names.length; i++) {
+  if (!names[i]) continue;
+  let mark = "";
+  try { mark = items[i].attributes.byName("AXMenuItemMarkChar").value() || ""; } catch (e) {}
+  file[names[i]] = [enabled[i], mark];
+}
+const wn = mb.menuBarItems.byName("Window").menus[0].menuItems.name();
+JSON.stringify({file: file, windows: wn.slice(wn.lastIndexOf("Arrange in Front") + 1).filter(n => n)});
+"""
+
+
+def _norm_title(text: str) -> str:
+    text = (text or "").lower()
+    for a, b in (("\u2018", "'"), ("\u2019", "'"), ("\u201c", '"'), ("\u201d", '"'), ("\u2013", "-"), ("\u2014", "-")):
+        text = text.replace(a, b)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+@dataclass
+class StoryState:
+    """News's File menu for the story in its window, and that window's title."""
+    windows: List[str]
+    saved: Optional[bool]          # None while no story is open (both Save items disabled)
+    reaction: Optional[str]        # like | dislike | None
+
+    @classmethod
+    def parse(cls, raw: dict) -> "StoryState":
+        file = raw.get("file") or {}
+
+        def on(name):
+            return bool(file.get(name, [False])[0])
+
+        def checked(name):
+            return bool((file.get(name) or [False, ""])[1])
+        saved = True if on("Unsave Story") else False if on("Save Story") else None
+        reaction = "like" if checked("Suggest More Stories Like This") else \
+            "dislike" if checked("Suggest Fewer Stories Like This") else None
+        return cls(list(raw.get("windows") or []), saved, reaction)
+
+    def shows(self, titles: List[str]) -> bool:
+        """Exactly one News window, and it is one of these stories (window titles are
+        "<headline> - <publisher>")."""
+        if len(self.windows) != 1:
+            return False
+        window = _norm_title(self.windows[0])
+        for t in titles:
+            t = _norm_title(t)
+            if len(t) < 8:
+                continue
+            if window == t or window.startswith(t + " - ") or (len(t) > 60 and window.startswith(t[:60])):
+                return True
+        return False
+
+
 class NewsApp:
     """Low-level control of News.app. Every method is synchronous."""
 
@@ -90,6 +163,24 @@ class NewsApp:
         try:
             return self._cmd(["osascript", "-e", 'tell application "System Events" to get bundle identifier of '
                               'first process whose frontmost is true'], 10)
+        except ActuatorError:
+            return None
+
+    def front_bundle(self) -> Optional[str]:
+        """The frontmost app's bundle id, cheaply (``lsappinfo``, ~15 ms; no Accessibility)."""
+        try:
+            asn = self._cmd(["lsappinfo", "front"], 5)
+            out = self._cmd(["lsappinfo", "info", "-only", "bundleid", asn], 5)
+        except (ActuatorError, OSError, subprocess.SubprocessError):
+            return None
+        m = re.search(r'"CFBundleIdentifier"="([^"]+)"', out)
+        return m.group(1) if m else None
+
+    def front_window_title(self) -> Optional[str]:
+        """The title of News's front window ("<headline> - <publisher>" for a story)."""
+        try:
+            return self._cmd(["osascript", "-e", 'tell application "System Events" to get name of front window '
+                              'of process "News"'], 10) or None
         except ActuatorError:
             return None
 
@@ -158,6 +249,17 @@ class NewsApp:
             'walk(win, 0); out.join("\\n")')
         return [line for line in out.splitlines() if line]
 
+    def story_state(self) -> StoryState:
+        """The open story's Save and Suggest items, read from the menu bar (works while News is in
+        the background or on another Space)."""
+        return StoryState.parse(json.loads(self._cmd(["osascript", "-l", "JavaScript", "-e", STORY_STATE_JS], 20)))
+
+    def press_file_item(self, name: str):
+        if name not in {a[0] for a in STORY_ACTIONS.values() if a[0]}:
+            raise ValueError("not a story menu item")
+        self._cmd(["osascript", "-e", 'tell application "System Events" to tell process "News" to click menu item '
+                   '"%s" of menu 1 of menu bar item "File" of menu bar 1' % name], 20)
+
     def search(self, query: str):
         """Type a search. Needs News in front for a moment; the caller restores focus."""
         clean = re.sub(r"[\"\\\r\n\t]", " ", query).strip()[:120]
@@ -211,7 +313,8 @@ class Yielded(Exception):
 class JobRunner:
     """Runs one News job at a time and records each in the store."""
 
-    TIMEOUTS = {"fetch_article": 25.0, "open_tag": 25.0, "refresh_today": 60.0, "search": 30.0}
+    TIMEOUTS = {"fetch_article": 25.0, "open_tag": 25.0, "refresh_today": 60.0, "search": 30.0,
+                "story_action": 20.0}
 
     def __init__(self, store: Store, harvester: Harvester, app: Optional[NewsApp] = None,
                  on_event: Optional[Callable[[str, dict], None]] = None, max_queue: int = 50,
@@ -245,7 +348,8 @@ class JobRunner:
             raise ValueError("unknown priority")
         with self._lock:
             for job in self._jobs.values():  # identical pending job: reuse it
-                if job.kind == kind and job.target == target and job.state in ("queued", "running"):
+                if job.kind == kind and job.target == target and job.params == params \
+                        and job.state in ("queued", "running"):
                     if job.state == "queued" and PRIORITIES[priority] < PRIORITIES[job.priority]:
                         job.priority = priority
                         self._enqueue(job)  # the old queue entry is skipped once this one has run
@@ -293,9 +397,22 @@ class JobRunner:
         self._thread.start()
         return self._thread
 
+    def stop(self, timeout: float = 10.0):
+        """Lets the job in hand finish, then ends the worker (queued jobs stay queued)."""
+        self._queue.put((-1, next(self._order), None))
+        if self._thread:
+            self._thread.join(timeout)
+
+    def busy(self, settle: float = 4.0) -> bool:
+        """A job is driving News, or did a moment ago (what News shows is then the relay's doing)."""
+        running = any(j.state == "running" for j in list(self._jobs.values()))
+        return running or time.time() - self._last_action < settle
+
     def _work(self):
         while True:
             _, _, job = self._queue.get()
+            if job is None:
+                return
             if job.state != "queued":
                 continue
             gap = self.min_gap - (time.time() - self._last_action)
@@ -396,17 +513,24 @@ class JobRunner:
         if not self.app.is_running():
             self.app.launch()
             self._sleep(4)
-        self.app.show_today()
+        try:
+            self.app.show_today()
+            window = True
+        except ActuatorError as e:
+            # News's window is out of Accessibility's reach (on another Space while someone uses
+            # the Mac): the menu still works, scrolling the feed doesn't.
+            log.info("refresh without the feed: %s", e)
+            window = False
         self._sleep(1)
         self.app.check_for_new_stories()
         self._sleep(4)
         pages = int(job.params.get("pages", 8))
-        scrolled = self.app.scroll_feed(pages) if pages else 0
+        scrolled = self.app.scroll_feed(pages) if pages and window else 0
         self._sleep(3)
         self.harvester.run_once()
         self._restore_focus(previous)
         total_after = self.store.read().execute("SELECT COUNT(*) FROM articles").fetchone()[0]
-        return {"pages_scrolled": scrolled, "new_articles": total_after - total_before,
+        return {"pages_scrolled": scrolled, "new_articles": total_after - total_before, "feed_reached": window,
                 "seconds": round(time.time() - start, 1)}
 
     def _run_search(self, job: Job) -> dict:
@@ -423,3 +547,55 @@ class JobRunner:
             "(SELECT article_id FROM documents WHERE captured_at >= ?) ORDER BY first_seen DESC LIMIT 200",
             (start - 1, start - 1)).fetchall()
         return {"seconds": round(time.time() - start, 1), "loaded_article_ids": [r[0] for r in rows]}
+
+    def _story_titles(self, article_id: str) -> List[str]:
+        titles = []
+        row = self.store.read().execute("SELECT title FROM articles WHERE id = ?", (article_id,)).fetchone()
+        if row and row[0]:
+            titles.append(row[0])
+        doc = self.store.document_for(article_id)
+        if doc and doc.get("title"):
+            titles.append(doc["title"])
+        return titles
+
+    def _run_story_action(self, job: Job) -> dict:
+        """Opens the story, makes sure News shows it, then sets one thing about it: saved or not,
+        liked, disliked or neither. Pressing an item that is already in the wanted state would undo
+        it, so the state is read first and only a change is pressed."""
+        article_id = job.target or ""
+        item, key, want = STORY_ACTIONS[job.params["action"]]
+        titles = self._story_titles(article_id)
+        if not titles:
+            raise ActuatorError("the relay doesn't know this story's title yet")
+        start = time.time()
+        self.app.open_article(article_id)
+        deadline = start + self.timeouts["story_action"] * self.pace
+        state = None
+        while time.time() < deadline:
+            state = self.app.story_state()
+            if state.saved is not None and state.shows(titles):
+                break
+            self._sleep(0.7)
+        else:
+            if state is not None and len(state.windows) > 1:
+                raise ActuatorError("News has %d windows open; close all but one" % len(state.windows))
+            raise ActuatorError("News didn't show the story")
+        before = getattr(state, key)
+        if key == "reaction" and want is None and before is not None:
+            item = STORY_ACTIONS[before][0]  # clearing: press the checked item again
+        changed = before != want
+        if changed:
+            self.app.press_file_item(item)
+            for _ in range(6):
+                self._sleep(0.5)
+                state = self.app.story_state()
+                if getattr(state, key) == want:
+                    break
+            else:
+                raise ActuatorError("News didn't take the change")
+        if key == "saved":
+            self.store.set_saved(article_id, bool(want))
+            self.on_event("saved.updated", {"article_id": article_id, "saved": bool(want)})
+        self.store.set_reaction(article_id, state.reaction)
+        return {"saved": state.saved, "reaction": state.reaction, "changed": changed,
+                "seconds": round(time.time() - start, 1)}

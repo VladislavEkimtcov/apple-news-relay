@@ -106,7 +106,8 @@ class FakeNews:
         self.write_entitlement(False)
 
     def close(self):
-        self.tmp.cleanup()
+        import shutil
+        shutil.rmtree(self.tmp.name, ignore_errors=True)
 
     def _touch_later(self, path: str):
         # mtime must move forward even when tests write twice within a second

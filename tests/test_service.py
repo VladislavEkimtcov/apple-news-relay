@@ -6,7 +6,7 @@ import time
 import unittest
 from urllib.parse import parse_qs, urlsplit
 
-from apple_news_relay.actuator import JobRunner, NewsApp
+from apple_news_relay.actuator import JobRunner, NewsApp, StoryState
 from apple_news_relay.api import EventHub, RelayApp, Request
 from apple_news_relay.harvester import Harvester
 from apple_news_relay.store import Store
@@ -30,6 +30,20 @@ class FakeNewsApp(NewsApp):
         self.news = news
         self.calls = []
         self.unopenable = set()
+        self.title_of = lambda article_id: "?"
+        self.showing = None          # the story in News's window
+        self.extra_windows = []
+        self.saved = set()
+        self.reactions = {}
+        self.stubborn = False        # News ignores menu presses
+        self.front = "com.apple.Terminal"
+        self.window = None
+
+    def front_bundle(self):
+        return self.front
+
+    def front_window_title(self):
+        return self.window
 
     def is_running(self):
         return True
@@ -44,8 +58,32 @@ class FakeNewsApp(NewsApp):
         super_check = __import__("apple_news_relay.actuator", fromlist=["ARTICLE_ID"]).ARTICLE_ID
         assert super_check.match(article_id)
         self.calls.append(("open_article", article_id))
+        self.showing = article_id
         if article_id not in self.unopenable:
             self.news.add_document("Adoc" + article_id[-6:], anf_document("Story " + article_id[-3:]))
+
+    def story_state(self):
+        windows = ([self.title_of(self.showing) + " - The Daily Example"] if self.showing else []) + self.extra_windows
+        file = {}
+        if self.showing:
+            file["Unsave Story" if self.showing in self.saved else "Save Story"] = [True, ""]
+            r = self.reactions.get(self.showing)
+            file["Suggest More Stories Like This"] = [True, "\u2713" if r == "like" else ""]
+            file["Suggest Fewer Stories Like This"] = [True, "\u2713" if r == "dislike" else ""]
+        return StoryState.parse({"file": file, "windows": windows})
+
+    def press_file_item(self, name):
+        self.calls.append(("press", name))
+        if self.stubborn:
+            return
+        s = self.showing
+        if name == "Save Story":
+            self.saved.add(s)
+        elif name == "Unsave Story":
+            self.saved.discard(s)
+        else:
+            r = "like" if "More" in name else "dislike"
+            self.reactions[s] = None if self.reactions.get(s) == r else r
 
     def open_tag(self, tag_id):
         self.calls.append(("open_tag", tag_id))
@@ -89,12 +127,14 @@ class ServiceTest(unittest.TestCase):
         self.events = EventHub()
         self.harvester = Harvester(self.store, self.news.paths, on_event=self.events.publish)
         self.fake = FakeNewsApp(self.news)
+        self.fake.title_of = lambda i: self.store.read().execute("SELECT title FROM articles WHERE id = ?", (i,)).fetchone()[0]
         self.jobs = JobRunner(self.store, self.harvester, self.fake, on_event=self.events.publish, min_gap=0, pace=0.02)
         self.jobs.start()
         self.app = RelayApp(self.store, self.harvester, self.jobs, self.news.paths, self.events)
         self.report = self.harvester.run_once(force=True)
 
     def tearDown(self):
+        self.jobs.stop()  # the worker may still be writing into the fake News folder
         self.news.close()
 
     def get(self, target, method="GET", body=b"", headers=None):
@@ -253,6 +293,18 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual(body["data"]["result"]["new_articles"], 1)
         self.assertIn(("scroll", 3), self.fake.calls)
 
+    def test_refresh_without_a_reachable_window(self):
+        from apple_news_relay.actuator import ActuatorError
+
+        def no_window():
+            raise ActuatorError("News has no window")
+        self.fake.show_today = no_window
+        status, body, _ = self.get("/v1/today/refresh?pages=3&wait=10", "POST")
+        self.assertEqual(body["data"]["state"], "succeeded")
+        self.assertFalse(body["data"]["result"]["feed_reached"])
+        self.assertIn(("check",), self.fake.calls)
+        self.assertNotIn(("scroll", 3), self.fake.calls)
+
     def test_async_job_and_polling(self):
         status, body, resp = self.get("/v1/channels/%s/refresh" % CH2, "POST")
         self.assertIn(status, (200, 202))
@@ -308,6 +360,114 @@ class ServiceTest(unittest.TestCase):
         self.get("/v1/saved?fetch_missing=true")
         jobs = [j for j in self.jobs.list() if j.kind == "fetch_article" and j.target == aid(999)]
         self.assertEqual([j.priority for j in jobs], ["background"])
+
+    # --------------------------------------------------------- handoff
+
+    def handoff(self):
+        from apple_news_relay.handoff import Handoff
+        seen = []
+        h = Handoff(self.store, self.fake, self.jobs, on_event=lambda k, d: seen.append((k, d)))
+        self.app.handoff = h
+        return h, seen
+
+    def test_handoff_offers_the_story_read_in_news(self):
+        h, seen = self.handoff()
+        self.assertIsNone(self.get("/v1/handoff")[1]["data"])
+        self.fake.front, self.fake.window = "com.apple.news", "Story number 9 about rivers - The Daily Example"
+        t = time.time()
+        h.check(now=t - 4)
+        self.assertIsNone(h.get(now=t - 4), "one look isn't enough")
+        h.check(now=t)
+        _, body, _ = self.get("/v1/handoff")
+        self.assertEqual(body["data"]["article"]["id"], aid(9))
+        self.assertTrue(body["data"]["on_screen"])
+        self.assertEqual(seen[-1][1]["article_id"], aid(9))
+        self.fake.front = "com.apple.Terminal"  # the reader moved on: still on offer, not on screen
+        h.check(now=t + 4)
+        self.assertFalse(h.get(now=t + 4)["on_screen"])
+        self.assertIsNone(h.get(now=t + 3600), "offered for half an hour")
+
+    def test_handoff_ignores_what_the_relay_opened(self):
+        h, _ = self.handoff()
+        self.fake.front, self.fake.window = "com.apple.news", "Story number 9 about rivers - The Daily Example"
+        self.jobs._last_action = time.time()
+        h.check()
+        h.check()
+        self.assertIsNone(h.get())
+
+    def test_handoff_ignores_pages_that_are_not_stories(self):
+        h, _ = self.handoff()
+        self.fake.front = "com.apple.news"
+        for title in ("Today", "The Daily Example", "Story number 1", None):
+            self.fake.window = title
+            h.check()
+            h.check()
+        self.assertIsNone(h.get())
+
+    # -------------------------------------------------- story actions
+
+    def test_save_and_unsave(self):
+        status, body, _ = self.get("/v1/saved/%s?wait=10" % aid(4), "PUT")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["data"]["result"]["saved"], True)
+        self.assertIn(("press", "Save Story"), self.fake.calls)
+        self.assertTrue(self.get("/v1/articles/%s?fetch=never" % aid(4))[1]["data"]["saved"])
+        self.assertIn(aid(4), [a["id"] for a in self.get("/v1/saved")[1]["data"]])
+        status, body, _ = self.get("/v1/saved/%s?wait=10" % aid(4), "DELETE")
+        self.assertEqual(body["data"]["result"]["saved"], False)
+        self.assertFalse(self.get("/v1/articles/%s?fetch=never" % aid(4))[1]["data"]["saved"])
+
+    def test_saving_twice_presses_once(self):
+        self.get("/v1/saved/%s?wait=10" % aid(4), "PUT")
+        _, body, _ = self.get("/v1/saved/%s?wait=10" % aid(4), "PUT")
+        self.assertFalse(body["data"]["result"]["changed"])
+        self.assertEqual([c for c in self.fake.calls if c[0] == "press"], [("press", "Save Story")])
+
+    def test_like_dislike_and_take_back(self):
+        put = lambda r: self.get("/v1/articles/%s/reaction?wait=10" % aid(6), "PUT", json.dumps({"reaction": r}).encode())
+        self.assertEqual(put("like")[1]["data"]["result"]["reaction"], "like")
+        self.assertEqual(self.get("/v1/articles/%s?fetch=never" % aid(6))[1]["data"]["reaction"], "like")
+        self.assertEqual(put("dislike")[1]["data"]["result"]["reaction"], "dislike")
+        _, body, _ = self.get("/v1/articles/%s/reaction?wait=10" % aid(6), "DELETE")
+        self.assertIsNone(body["data"]["result"]["reaction"])
+        self.assertEqual([c[1] for c in self.fake.calls if c[0] == "press"],
+                         ["Suggest More Stories Like This", "Suggest Fewer Stories Like This",
+                          "Suggest Fewer Stories Like This"])
+        self.assertIsNone(self.get("/v1/articles/%s?fetch=never" % aid(6))[1]["data"]["reaction"])
+        self.assertEqual(put("love")[0], 400)
+
+    def test_story_action_never_touches_another_story(self):
+        self.fake.unopenable.add(aid(8))
+        original = self.fake.open_article
+        self.fake.open_article = lambda i: (original(i), setattr(self.fake, "showing", aid(9)))
+        _, body, _ = self.get("/v1/saved/%s?wait=10" % aid(8), "PUT")
+        self.assertEqual(body["data"]["state"], "failed")
+        self.assertNotIn("press", [c[0] for c in self.fake.calls])
+        self.fake.open_article = original
+        self.fake.extra_windows = ["Something else - Another Paper"]
+        _, body, _ = self.get("/v1/saved/%s?wait=10" % aid(10), "PUT")
+        self.assertIn("windows", body["data"]["error"])
+        self.assertNotIn("press", [c[0] for c in self.fake.calls])
+
+    def test_story_action_reports_a_change_news_ignored(self):
+        self.fake.stubborn = True
+        _, body, _ = self.get("/v1/saved/%s?wait=10" % aid(4), "PUT")
+        self.assertEqual(body["data"]["state"], "failed")
+        self.assertFalse(self.get("/v1/articles/%s?fetch=never" % aid(4))[1]["data"]["saved"])
+
+    def test_save_and_unsave_are_separate_jobs(self):
+        gate = threading.Event()
+        original = self.fake.open_tag
+        self.fake.open_tag = lambda t: (gate.wait(5), original(t))
+        self.jobs.submit("open_tag", CH)
+        a = self.jobs.submit("story_action", aid(4), "interactive", action="save")
+        b = self.jobs.submit("story_action", aid(4), "interactive", action="unsave")
+        c = self.jobs.submit("story_action", aid(4), "interactive", action="unsave")
+        gate.set()
+        self.assertIsNot(a, b)
+        self.assertIs(b, c)
+        self.assertTrue(b.done.wait(10))
+        self.assertFalse(b.result["saved"])
 
     # --------------------------------------------------------- protocol
 

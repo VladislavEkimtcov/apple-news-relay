@@ -116,6 +116,12 @@ CREATE TABLE IF NOT EXISTS saved (
     removed_at REAL
 );
 
+CREATE TABLE IF NOT EXISTS reactions (
+    article_id TEXT PRIMARY KEY,
+    reaction TEXT NOT NULL,          -- like | dislike, as last set or seen through the relay
+    updated_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS history (
     article_id TEXT PRIMARY KEY,
     read_at REAL
@@ -371,6 +377,31 @@ class Store:
             if ids:
                 cur.execute("UPDATE saved SET removed_at = ? WHERE removed_at IS NULL AND article_id NOT IN (%s)"
                             % ",".join("?" * len(ids)), [now] + ids)
+            self._writer.commit()
+
+    def set_saved(self, article_id: str, saved: bool, now: Optional[float] = None):
+        """Records a save or unsave the relay made, before News's own list catches up."""
+        now = now or time.time()
+        with self._lock:
+            if saved:
+                self._writer.execute("""INSERT INTO saved VALUES (?, ?, NULL) ON CONFLICT(article_id) DO UPDATE SET
+                                        saved_at = COALESCE(saved.saved_at, excluded.saved_at), removed_at = NULL
+                                        WHERE saved.removed_at IS NOT NULL OR saved.saved_at IS NULL""",
+                                     (article_id, now))
+                self._writer.execute("UPDATE saved SET saved_at = ? WHERE article_id = ? AND removed_at IS NULL "
+                                     "AND saved_at IS NULL", (now, article_id))
+            else:
+                self._writer.execute("UPDATE saved SET removed_at = ? WHERE article_id = ? AND removed_at IS NULL",
+                                     (now, article_id))
+            self._writer.commit()
+
+    def set_reaction(self, article_id: str, reaction: Optional[str], now: Optional[float] = None):
+        with self._lock:
+            if reaction:
+                self._writer.execute("INSERT OR REPLACE INTO reactions VALUES (?, ?, ?)",
+                                     (article_id, reaction, now or time.time()))
+            else:
+                self._writer.execute("DELETE FROM reactions WHERE article_id = ?", (article_id,))
             self._writer.commit()
 
     def update_history(self, items: List[HistoryItem]):

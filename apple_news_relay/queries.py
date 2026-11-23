@@ -267,6 +267,7 @@ def article_detail(conn: sqlite3.Connection, store, row: sqlite3.Row, entitled: 
         "SELECT p.*, s.title FROM placements p LEFT JOIN sections s ON s.slug = p.section_slug "
         "WHERE p.article_id = ? ORDER BY p.first_seen", (row["id"],))]
     saved = conn.execute("SELECT saved_at FROM saved WHERE article_id = ? AND removed_at IS NULL", (row["id"],)).fetchone()
+    reaction = conn.execute("SELECT reaction FROM reactions WHERE article_id = ?", (row["id"],)).fetchone()
     out.update({
         "topics": topics,
         "related_ids": loads(row["related_ids"], []),
@@ -274,13 +275,17 @@ def article_detail(conn: sqlite3.Connection, store, row: sqlite3.Row, entitled: 
         "maturity": row["maturity"],
         "video_url": row["video_url"],
         "narration_url": row["narration_url"],
+        "saved": saved is not None,
         "saved_at": iso(saved[0]) if saved else None,
+        "reaction": reaction[0] if reaction else None,
         "placements": placements,
         "body": article_body(conn, store, row, entitled, include_ads),
     })
     out["links"].update({
         "fetch": "/v1/articles/%s/fetch" % row["id"],
         "related": "/v1/articles/%s/related" % row["id"],
+        "save": "/v1/saved/%s" % row["id"],
+        "reaction": "/v1/articles/%s/reaction" % row["id"],
     })
     if row["channel_id"]:
         out["links"]["channel"] = "/v1/channels/" + row["channel_id"]

@@ -92,11 +92,14 @@ All responses are JSON. Collections look like this:
 | `GET /v1/articles/{id}/related` | related stories News lists for it |
 | `GET /v1/channels` · `/v1/topics` | publishers and topics, with article counts; `/{id}`, `/{id}/articles`, `POST /{id}/refresh` |
 | `GET /v1/saved` · `/v1/history` | Saved Stories and reading history |
+| `PUT` · `DELETE /v1/saved/{id}` | save a story in News, or take it out of Saved Stories |
+| `PUT` · `DELETE /v1/articles/{id}/reaction` | `{"reaction": "like"}` or `"dislike"`: Suggest More / Fewer Stories Like This, or neither |
+| `GET /v1/handoff` | the story being read in News on the Mac right now, for another screen to pick up |
 | `GET /v1/search?q=` | full-text search over everything archived, with highlighted snippets |
 | `POST /v1/searches` `{"query": "…"}` | run the search in News itself, archiving what it finds |
 | `POST /v1/today/refresh?pages=8` | refresh Today in News and scroll it to load more |
 | `GET /v1/jobs/{id}?wait=30` | follow a News job; `DELETE` cancels a queued one |
-| `GET /v1/events` | Server-Sent Events: `articles.added`, `article.body_captured`, `sections.updated`, `job.updated` |
+| `GET /v1/events` | Server-Sent Events: `articles.added`, `article.body_captured`, `sections.updated`, `saved.updated`, `handoff.updated`, `job.updated` |
 | `GET /v1/status` · `/v1/stats` | health, account, harvester; archive statistics |
 
 An article body is a list of blocks a client can render without knowing anything about Apple

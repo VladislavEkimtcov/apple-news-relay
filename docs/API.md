@@ -104,6 +104,46 @@ If the job is still running when `wait` runs out, the article comes back with
 | `open_tag` | `POST /v1/channels/{id}/refresh`, `/v1/topics/{id}/refresh`, `/v1/sections/{id}/refresh` | 10–35 s |
 | `refresh_today` | `POST /v1/today/refresh?pages=N` | 30–60 s |
 | `search` | `POST /v1/searches` | ~10 s |
+| `story_action` | `PUT`/`DELETE /v1/saved/{id}`, `PUT`/`DELETE /v1/articles/{id}/reaction` | 2–3 s |
+
+## Saving, liking and disliking
+
+These change the story in News itself (and so on every device signed in to the same Apple ID):
+
+```sh
+curl -X PUT    'localhost:8787/v1/saved/A1b2C3…?wait=25'        # Save Story
+curl -X DELETE 'localhost:8787/v1/saved/A1b2C3…?wait=25'        # Unsave Story
+curl -X PUT    'localhost:8787/v1/articles/A1b2C3…/reaction?wait=25' -d '{"reaction": "like"}'
+curl -X DELETE 'localhost:8787/v1/articles/A1b2C3…/reaction?wait=25'   # neither
+```
+
+`like` is News's *Suggest More Stories Like This* and `dislike` *Suggest Fewer Stories Like
+This*. The two exclude each other. The finished job's `result` is the story's state in News
+afterwards, e.g. `{"saved": true, "reaction": null, "changed": true}`. Asking for the state it is
+already in changes nothing (`changed: false`).
+
+How it's done: the relay opens the story (as for a fetch), waits until News's Window menu names
+that very story, reads the File menu (Save Story or Unsave Story; a check mark on Suggest More or
+Fewer), presses one item, and reads the menu again to confirm. If News shows another story or has
+more than one window, the job fails without pressing anything. `GET /v1/articles/{id}` reports
+`saved` and `reaction` (as last set or seen through the relay).
+
+## Handoff: what the Mac is reading
+
+`GET /v1/handoff` names the story open in News on the Mac, so another screen can carry on with
+it:
+
+```json
+{"data": {"article": {"id": "A…", "title": "…", …}, "on_screen": true,
+          "since": "2026-11-23T14:02:10Z", "seen_at": "2026-11-23T14:06:58Z"}, "meta": {"watching": true}}
+```
+
+`on_screen` is true while News is the frontmost app and shows it. A story stays on offer for half
+an hour after it was last on screen; then `data` is `null`. The relay watches every 4 s (the
+frontmost app with `lsappinfo`, and News's window title only while News is in front), counts a
+story after two looks in a row, and ignores what's on screen while one of its own jobs is driving
+News. Each change is also a `handoff.updated` event. Start the relay with `--no-handoff` to turn
+the watching off.
 
 ## Events
 
@@ -117,7 +157,7 @@ data: {"count": 37, "ids": ["A…", …], "seq": 17, "at": "2026-11-23T07:01:12Z
 ```
 
 Events: `articles.added`, `article.body_captured`, `sections.updated`, `saved.updated`,
-`job.updated`. A comment line every 15 s keeps proxies from closing the connection.
+`handoff.updated`, `job.updated`. A comment line every 15 s keeps proxies from closing the connection.
 
 ## History
 

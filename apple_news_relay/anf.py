@@ -9,7 +9,7 @@ the component tree into blocks:
     quote      {text}
     image      {url, width, height, caption?}
     gallery    {images: [image...]}
-    video      {poster?}
+    video      {url?, poster?, caption?, aspect_ratio?}   url: HLS or MP4 as the publisher serves it
     embed      {provider, url}
     divider    {}
 
@@ -97,6 +97,7 @@ class _Converter:
             if isinstance(res, dict) and res.get("imageIdentifier"):
                 self.images[res["imageIdentifier"]] = res
         self.blocks: List[dict] = []
+        self.media_seen: set = set()
         self.removed: Dict[str, int] = {}
         self.byline: Optional[str] = None
         self.intro: Optional[str] = None
@@ -127,6 +128,33 @@ class _Converter:
             caption = comp["captionComponent"].get("text")
         if caption:
             block["caption"] = plain_text(str(caption), None)
+        return block
+
+    def media(self, role: str, comp: dict) -> Optional[dict]:
+        """A video or audio clip. Its stream is a document resource (``resourceIdentifier``) or the
+        component's own ``URL``. Hidden copies (``hidden`` without a ``conditional`` that could show
+        them) are dropped, and a clip already placed (layouts for phone and tablet) only counts once."""
+        if comp.get("hidden") and not comp.get("conditional"):
+            return None
+        res = (self.doc.get("resources") or {}).get(comp.get("resourceIdentifier") or "") or {}
+        url = res.get("URL") or comp.get("URL")
+        url = url if isinstance(url, str) and url.startswith(("https://", "http://")) else None
+        key = url or comp.get("stillImageIdentifier") or comp.get("identifier")
+        if key in self.media_seen:
+            return None
+        self.media_seen.add(key)
+        poster = self.image({"imageIdentifier": comp.get("stillImageIdentifier")}) if comp.get("stillImageIdentifier") else None
+        block = {"type": role, "url": url, "poster": poster["url"] if poster else None}
+        caption = comp.get("caption")
+        if isinstance(caption, dict):
+            caption = caption.get("text")
+        if caption:
+            block["caption"] = plain_text(str(caption), None)
+        ratio = comp.get("aspectRatio")
+        if isinstance(ratio, (int, float)) and 0.3 < ratio < 4:
+            block["aspect_ratio"] = round(float(ratio), 4)
+        elif poster and poster.get("width") and poster.get("height"):
+            block["aspect_ratio"] = round(poster["width"] / poster["height"], 4)
         return block
 
     def walk(self, comps, in_aside: bool = False):
@@ -188,8 +216,7 @@ class _Converter:
             images = [i for i in (self.image(item) for item in comp.get("items") or []) if i]
             return {"type": "gallery", "images": images} if images else None
         if role in ("video", "audio"):
-            poster = self.image({"imageIdentifier": comp.get("stillImageIdentifier")}) if comp.get("stillImageIdentifier") else None
-            return {"type": role, "poster": poster["url"] if poster else None}
+            return self.media(role, comp)
         if role in EMBED_ROLES:
             return {"type": "embed", "provider": EMBED_ROLES[role], "url": comp.get("URL")}
         if role == "divider":
@@ -241,11 +268,21 @@ def convert(doc: dict, keep_promotions: bool = False) -> Document:
 def clean_byline(text: Optional[str], publisher: Optional[str] = None) -> Optional[str]:
     """A byline as names only: ``"by Dennis Romero | NBC NEWS"`` -> ``"Dennis Romero"``.
 
-    Drops a leading "By" and a trailing publisher name (after ``|``, ``·``, a comma or a dash)."""
+    Drops a leading "By" and a trailing publisher name (after ``|``, ``·``, a comma or a dash),
+    and a byline that is only a date ("Published on November 23, 2026") altogether."""
     if not text:
         return text
     t = re.sub(r"\s+", " ", text).strip()
+    if re.match(r"^(published|updated|posted)\b", t, re.I):
+        # A dateline in the byline slot ("Published on November 23, 2026"): names only if it has them.
+        named = re.search(r"\bby\s+(.+)$", t, re.I)
+        if not named:
+            return None
+        t = named.group(1)
     t = re.sub(r"^by\s+", "", t, flags=re.I)
+    # "Sudiksha Kochi - 11/23/26 06:00 AM EST": the date goes, the reader shows its own.
+    t = re.sub(r"\s*(?:[|·•,]|\s[-–—])\s*(?:\d{1,2}/\d{1,2}/\d{2,4}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.? \d{1,2},? \d{4}).*$",
+               "", t, flags=re.I)
     if publisher:
         t = re.sub(r"\s*(?:[|·•,]|\s[-–—])\s*" + re.escape(publisher.strip()) + r"\.?$", "", t, flags=re.I)
     return t.strip() or text

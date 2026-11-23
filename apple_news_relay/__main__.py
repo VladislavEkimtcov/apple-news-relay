@@ -19,6 +19,7 @@ import sys
 from . import __version__
 from .actuator import JobRunner, NewsApp
 from .api import EventHub, RelayApp, serve
+from .handoff import Handoff
 from .harvester import Harvester
 from .newscache import NewsPaths, read_entitlement
 from .store import Store, default_path
@@ -31,8 +32,9 @@ def build(args) -> RelayApp:
     harvester = Harvester(store, paths, on_event=events.publish)
     jobs = JobRunner(store, harvester, NewsApp(), on_event=events.publish)
     allow = [a for a in (args.allow or "").split(",") if a]
+    handoff = None if getattr(args, "no_handoff", True) else Handoff(store, jobs.app, jobs, on_event=events.publish)
     return RelayApp(store, harvester, jobs, paths, events, token=args.token or os.environ.get("NEWS_RELAY_TOKEN"),
-                    allow=allow)
+                    allow=allow, handoff=handoff)
 
 
 def cmd_serve(args) -> int:
@@ -40,6 +42,8 @@ def cmd_serve(args) -> int:
     app.harvester.run_once(force=True)
     app.harvester.start(args.interval)
     app.jobs.start()
+    if app.handoff:
+        app.handoff.start()
     keep_awake = None
     if args.keep_awake:
         keep_awake = subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])
@@ -124,6 +128,8 @@ def main(argv=None) -> int:
     p.add_argument("--allow", help="comma-separated client addresses or networks, e.g. 127.0.0.1,192.168.1.0/24")
     p.add_argument("--keep-awake", action="store_true", help="keep the Mac from idle-sleeping while serving")
     p.add_argument("--no-bonjour", action="store_true", help="don't advertise _newsrelay._tcp on the LAN")
+    p.add_argument("--no-handoff", action="store_true",
+                   help="don't watch which story News shows on this Mac (GET /v1/handoff stays empty)")
     p.set_defaults(func=cmd_serve)
     sub.add_parser("harvest", help="harvest once and print a report").set_defaults(func=cmd_harvest)
     sub.add_parser("doctor", help="check access to News and its cache").set_defaults(func=cmd_doctor)

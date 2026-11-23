@@ -289,8 +289,9 @@ class RelayApp:
 
     def __init__(self, store: Store, harvester: Harvester, jobs: JobRunner, paths: Optional[NewsPaths] = None,
                  events: Optional[EventHub] = None, token: Optional[str] = None,
-                 allow: Sequence[str] = (), cors_origin: str = "*"):
+                 allow: Sequence[str] = (), cors_origin: str = "*", handoff=None):
         self.store = store
+        self.handoff = handoff
         self.harvester = harvester
         self.jobs = jobs
         self.paths = paths or NewsPaths()
@@ -393,7 +394,12 @@ class RelayApp:
             r("GET", "/v1/%s/{id}/articles" % plural, self._tag_articles(kind), "Articles in a %s" % kind)
             r("POST", "/v1/%s/{id}/refresh" % plural, self._tag_refresh(kind), "Open a %s in News" % kind)
         r("GET", "/v1/saved", self.saved, "Saved Stories")
+        r("PUT", "/v1/saved/{id}", self.story_action("save"), "Save a story in News")
+        r("DELETE", "/v1/saved/{id}", self.story_action("unsave"), "Remove a story from Saved Stories")
+        r("PUT", "/v1/articles/{id}/reaction", self.reaction_put, "Suggest more or fewer stories like this one")
+        r("DELETE", "/v1/articles/{id}/reaction", self.story_action("clear_reaction"), "Take back a like or dislike")
         r("GET", "/v1/history", self.history, "Reading history")
+        r("GET", "/v1/handoff", self.handoff_get, "The story being read in News on the Mac right now")
         r("GET", "/v1/search", self.search, "Full-text search of the archive")
         r("POST", "/v1/searches", self.search_remote, "Run a search in News")
         r("GET", "/v1/jobs", self.job_list, "Recent News jobs")
@@ -422,6 +428,7 @@ class RelayApp:
         return Response(200, {"name": "apple-news-relay", "version": __version__, "links": {
             "status": "/v1/status", "stats": "/v1/stats", "articles": "/v1/articles", "sections": "/v1/sections",
             "channels": "/v1/channels", "topics": "/v1/topics", "saved": "/v1/saved", "history": "/v1/history",
+            "handoff": "/v1/handoff",
             "search": "/v1/search", "jobs": "/v1/jobs", "events": "/v1/events", "openapi": "/openapi.json"}})
 
     def status(self, req: Request) -> Response:
@@ -510,6 +517,22 @@ class RelayApp:
         job = self.submit("fetch_article", row["id"], "interactive")
         self.wait_for(job, req)
         return accepted(job.to_dict()) if not job.done.is_set() else Response(200, {"data": job.to_dict()})
+
+    def story_action(self, action: str) -> Handler:
+        """Save, unsave, like, dislike: a job that opens the story in News and presses one menu
+        item. Answers 202 with the job, or 200 with the result when ``wait`` was long enough."""
+        def handler(req: Request) -> Response:
+            row = self.article_row(self.store.read(), req.params["id"])
+            job = self.submit("story_action", row["id"], "interactive", action=action)
+            self.wait_for(job, req)
+            return accepted(job.to_dict()) if not job.done.is_set() else Response(200, {"data": job.to_dict()})
+        return handler
+
+    def reaction_put(self, req: Request) -> Response:
+        reaction = req.json().get("reaction") or req.get("reaction")
+        if reaction not in ("like", "dislike"):
+            raise bad_param("reaction", "like or dislike")
+        return self.story_action(reaction)(req)
 
     def article_related(self, req: Request) -> Response:
         conn = self.store.read()
@@ -737,6 +760,24 @@ class RelayApp:
         payload["links"] = {"results": "/v1/search?" + urlencode({"q": q})}
         return accepted(payload) if not job.done.is_set() else Response(200, {"data": payload})
 
+    def handoff_get(self, req: Request) -> Response:
+        """Like Handoff: the story open in News on the Mac (or read there in the last half hour),
+        for a client to carry on with. ``data`` is null when there's none or watching is off."""
+        current = self.handoff.get() if self.handoff else None
+        if not current:
+            return Response(200, {"data": None, "meta": {"watching": self.handoff is not None}})
+        conn = self.store.read()
+        rows = Q.get_article_rows(conn, [current["article_id"]])
+        row = rows.get(current["article_id"])
+        if row is None:
+            return Response(200, {"data": None, "meta": {"watching": True}})
+        return Response(200, {"data": {
+            "article": Q.article_summary(row, self.entitled()),
+            "on_screen": current["on_screen"],
+            "since": Q.iso(current["since"]),
+            "seen_at": Q.iso(current["seen_at"]),
+        }, "meta": {"watching": True}})
+
     def job_list(self, req: Request) -> Response:
         limit = req.int("limit", DEFAULT_LIMIT, 1, MAX_LIMIT)
         state = req.choice("state", ["queued", "running", "succeeded", "failed", "cancelled"])
@@ -798,7 +839,7 @@ class RelayApp:
     def handle(self, req: Request) -> Response:
         try:
             if req.method == "OPTIONS":
-                return Response(204, headers={"Allow": "GET, POST, DELETE, OPTIONS"})
+                return Response(204, headers={"Allow": "GET, POST, PUT, DELETE, OPTIONS"})
             self.authorize(req)
             handler, params = self.router.match(req.method, req.path)
             req.params = params
@@ -833,7 +874,7 @@ def make_handler(app: RelayApp):
             headers = {
                 "Access-Control-Allow-Origin": app.cors_origin,
                 "Access-Control-Allow-Headers": "Authorization, Content-Type, If-None-Match, Prefer",
-                "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
                 "Access-Control-Expose-Headers": "ETag, Link, Location, Retry-After, X-Request-Id",
                 "X-Request-Id": request_id,
             }
