@@ -157,6 +157,28 @@ def slugify(kind: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "section"
 
 
+class _Rows(list):
+    """Rows already fetched, with the cursor methods readers use."""
+
+    def fetchone(self):
+        return self[0] if self else None
+
+    def fetchall(self):
+        return list(self)
+
+
+class _TakingTurns:
+    """An in-memory database has a single connection; readers on other threads take turns on it
+    under the store's lock and get their rows fetched in full."""
+
+    def __init__(self, conn: sqlite3.Connection, lock):
+        self._conn, self._lock = conn, lock
+
+    def execute(self, sql: str, params=()) -> _Rows:
+        with self._lock:
+            return _Rows(self._conn.execute(sql, params).fetchall())
+
+
 class Store:
     """Thread-safe access to the relay database. Reads open short-lived
     connections; writes go through one lock."""
@@ -180,16 +202,17 @@ class Store:
         conn.execute("PRAGMA foreign_keys=OFF")
         return conn
 
-    def read(self) -> sqlite3.Connection:
-        """A connection for reading. In-memory stores share the writer."""
+    def read(self):
+        """A connection for reading. In-memory stores share the writer, one thread at a time."""
         if self.path == ":memory:":
-            return self._writer
+            return _TakingTurns(self._writer, self._lock)
         return self._open()
 
     # ------------------------------------------------------------------ meta
 
     def get_meta(self, key: str, default: Optional[str] = None) -> Optional[str]:
-        row = self._writer.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        with self._lock:
+            row = self._writer.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         return row[0] if row else default
 
     def set_meta(self, key: str, value: str):
@@ -297,7 +320,8 @@ class Store:
         return json.loads(zlib.decompress(row[0]).decode("utf-8"))
 
     def has_document(self, asset_id: str) -> bool:
-        return self._writer.execute("SELECT 1 FROM documents WHERE asset_id = ?", (asset_id,)).fetchone() is not None
+        with self._lock:
+            return self._writer.execute("SELECT 1 FROM documents WHERE asset_id = ?", (asset_id,)).fetchone() is not None
 
     def update_sections(self, sections: List[Section], now: Optional[float] = None):
         """Record the current Today feed and extend placement history."""

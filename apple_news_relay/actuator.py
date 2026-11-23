@@ -19,6 +19,7 @@ a command line, and nothing ever clicks inside story content, so ads,
 
 from __future__ import annotations
 
+import itertools
 import logging
 import queue
 import re
@@ -186,16 +187,25 @@ class Job:
     finished_at: Optional[float] = None
     result: Optional[Dict] = None
     error: Optional[str] = None
+    priority: str = "normal"
     done: threading.Event = field(default_factory=threading.Event, repr=False)
 
     def to_dict(self) -> dict:
         return {"id": self.id, "kind": self.kind, "target": self.target, "state": self.state,
-                "created_at": self.created_at, "started_at": self.started_at, "finished_at": self.finished_at,
-                "result": self.result, "error": self.error}
+                "priority": self.priority, "created_at": self.created_at, "started_at": self.started_at,
+                "finished_at": self.finished_at, "result": self.result, "error": self.error}
+
+
+#: Queue order: someone is waiting on the answer, then refreshes, then prefetching.
+PRIORITIES = {"interactive": 0, "normal": 1, "background": 2}
 
 
 class QueueFull(RuntimeError):
     pass
+
+
+class Yielded(Exception):
+    """A background job stepped aside for one someone is waiting on; it runs again later."""
 
 
 class JobRunner:
@@ -214,7 +224,8 @@ class JobRunner:
         self.min_gap = min_gap
         self.pace = pace  # scales every wait below; tests run at a fraction of real time
         self.timeouts = dict(self.TIMEOUTS)
-        self._queue: "queue.Queue[Job]" = queue.Queue()
+        self._queue: "queue.PriorityQueue" = queue.PriorityQueue()
+        self._order = itertools.count()
         self._jobs: Dict[str, Job] = {}
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
@@ -225,12 +236,19 @@ class JobRunner:
     #: A fetch that failed is not retried for this long: News could not open that story.
     RETRY_AFTER = 6 * 3600.0
 
-    def submit(self, kind: str, target: Optional[str] = None, **params) -> Job:
+    def submit(self, kind: str, target: Optional[str] = None, priority: str = "normal", **params) -> Job:
+        """Queues a job, or returns the identical one already pending (moved up if this need is
+        more urgent). ``priority``: interactive, normal or background."""
         if kind not in self.TIMEOUTS:
             raise ValueError("unknown job kind")
+        if priority not in PRIORITIES:
+            raise ValueError("unknown priority")
         with self._lock:
             for job in self._jobs.values():  # identical pending job: reuse it
                 if job.kind == kind and job.target == target and job.state in ("queued", "running"):
+                    if job.state == "queued" and PRIORITIES[priority] < PRIORITIES[job.priority]:
+                        job.priority = priority
+                        self._enqueue(job)  # the old queue entry is skipped once this one has run
                     return job
             if kind == "fetch_article":
                 recent = [j for j in self._jobs.values() if j.kind == kind and j.target == target
@@ -240,13 +258,16 @@ class JobRunner:
                     return max(recent, key=lambda j: j.finished_at or 0)
             if sum(1 for j in self._jobs.values() if j.state == "queued") >= self.max_queue:
                 raise QueueFull("too many queued jobs")
-            job = Job(kind, target, params)
+            job = Job(kind, target, params, priority=priority)
             self._jobs[job.id] = job
             self._prune()
+            self._enqueue(job)
         self.store.put_job(job.to_dict())
-        self._queue.put(job)
         self.on_event("job.updated", job.to_dict())
         return job
+
+    def _enqueue(self, job: Job):
+        self._queue.put((PRIORITIES[job.priority], next(self._order), job))
 
     def get(self, job_id: str) -> Optional[Job]:
         return self._jobs.get(job_id)
@@ -274,7 +295,7 @@ class JobRunner:
 
     def _work(self):
         while True:
-            job = self._queue.get()
+            _, _, job = self._queue.get()
             if job.state != "queued":
                 continue
             gap = self.min_gap - (time.time() - self._last_action)
@@ -286,6 +307,12 @@ class JobRunner:
             try:
                 job.result = getattr(self, "_run_" + job.kind)(job)
                 self._finish(job, "succeeded")
+            except Yielded:
+                job.state, job.started_at = "queued", None
+                self.store.put_job(job.to_dict())
+                self.on_event("job.updated", job.to_dict())
+                with self._lock:
+                    self._enqueue(job)
             except Exception as e:
                 log.warning("job %s %s failed: %s", job.kind, job.target, e)
                 job.error = str(e)[:300]
@@ -301,7 +328,13 @@ class JobRunner:
     def _sleep(self, seconds: float):
         time.sleep(seconds * self.pace)
 
-    def _wait_for(self, predicate: Callable[[], bool], timeout: float, poll: float = 1.0) -> bool:
+    def _urgent_waiting(self) -> bool:
+        return any(j.state == "queued" and j.priority == "interactive" for j in list(self._jobs.values()))
+
+    def _wait_for(self, predicate: Callable[[], bool], timeout: float, poll: float = 1.0,
+                  yielding: bool = False) -> bool:
+        """Harvests until ``predicate`` holds or ``timeout`` passes. ``yielding``: raise
+        :class:`Yielded` as soon as an interactive job is queued."""
         timeout *= self.pace
         poll *= self.pace
         deadline = time.time() + timeout
@@ -309,6 +342,8 @@ class JobRunner:
             self.harvester.run_once()
             if predicate():
                 return True
+            if yielding and self._urgent_waiting():
+                raise Yielded()
             time.sleep(poll)
         self.harvester.run_once()
         return predicate()
@@ -332,7 +367,8 @@ class JobRunner:
             return {"captured": True, "already_cached": True}
         start = time.time()
         self.app.open_article(article_id)
-        ok = self._wait_for(lambda: self._has_body(article_id), self.timeouts["fetch_article"])
+        ok = self._wait_for(lambda: self._has_body(article_id), self.timeouts["fetch_article"],
+                            yielding=job.priority == "background")
         return {"captured": ok, "seconds": round(time.time() - start, 1)}
 
     def _count_tag(self, tag_id: str) -> int:

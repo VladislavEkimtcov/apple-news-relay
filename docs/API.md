@@ -72,13 +72,20 @@ Responses over 1 KB are gzipped when the client accepts it.
 ## Jobs: making News load things
 
 Some requests need the News app to do something: download a story, refresh Today, open a
-channel, search. These are jobs. They run one at a time, in order.
+channel, search. These are jobs. They run one at a time, most urgent first (`priority` on each
+job):
+
+- `interactive`: someone is waiting on it: a story opened with `GET /v1/articles/{id}`, a fetch,
+  a search.
+- `normal`: refreshes of Today, sections, channels and topics.
+- `background`: prefetching, such as `/v1/saved?fetch_missing=true`.
 
 - `POST` endpoints that start a job answer `202 Accepted` with the job and a `Location` header
   (`/v1/jobs/{id}`), or `200` with the finished job if it completed within `wait`.
 - Add `wait=N` (0–60 seconds) to block until the job finishes, instead of polling.
 - `GET /v1/jobs/{id}?wait=30` blocks until that job is done.
-- An identical job that's already queued or running is reused, not repeated.
+- An identical job that's already queued or running is reused, not repeated (and moved up
+  if the new request is more urgent).
 - A story News couldn't open isn't retried for 6 hours; the job comes back `captured: false`.
 
 `GET /v1/articles/{id}` starts a fetch by itself when the body is missing (`fetch=auto`, the

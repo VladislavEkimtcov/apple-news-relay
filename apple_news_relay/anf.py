@@ -238,6 +238,19 @@ def convert(doc: dict, keep_promotions: bool = False) -> Document:
     )
 
 
+def clean_byline(text: Optional[str], publisher: Optional[str] = None) -> Optional[str]:
+    """A byline as names only: ``"by Dennis Romero | NBC NEWS"`` -> ``"Dennis Romero"``.
+
+    Drops a leading "By" and a trailing publisher name (after ``|``, ``·``, a comma or a dash)."""
+    if not text:
+        return text
+    t = re.sub(r"\s+", " ", text).strip()
+    t = re.sub(r"^by\s+", "", t, flags=re.I)
+    if publisher:
+        t = re.sub(r"\s*(?:[|·•,]|\s[-–—])\s*" + re.escape(publisher.strip()) + r"\.?$", "", t, flags=re.I)
+    return t.strip() or text
+
+
 def preview(blocks: List[dict], max_chars: int = 700, max_paragraphs: int = 3) -> List[dict]:
     """The opening of a story: leading media plus the first few paragraphs,
     the way a publisher shows a lede before its paywall."""

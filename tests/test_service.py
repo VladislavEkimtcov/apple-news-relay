@@ -2,6 +2,7 @@
 
 import json
 import threading
+import time
 import unittest
 from urllib.parse import parse_qs, urlsplit
 
@@ -269,6 +270,44 @@ class ServiceTest(unittest.TestCase):
         gate.set()
         self.assertIs(a, b)
         self.assertTrue(a.done.wait(10))
+
+    def test_waiting_reader_jumps_the_prefetch_queue(self):
+        gate = threading.Event()
+        original = self.fake.open_tag
+        self.fake.open_tag = lambda t: (gate.wait(5), original(t))
+        busy = self.jobs.submit("open_tag", CH)  # holds the worker while the queue fills
+        later = [self.jobs.submit("fetch_article", aid(n), "background") for n in (11, 12)]
+        urgent = self.jobs.submit("fetch_article", aid(13), "interactive")
+        moved = self.jobs.submit("fetch_article", aid(12), "interactive")
+        self.assertIs(moved, later[1])
+        self.assertEqual(moved.priority, "interactive")
+        gate.set()
+        for job in [busy, urgent] + later:
+            self.assertTrue(job.done.wait(10))
+        opened = [c[1] for c in self.fake.calls if c[0] == "open_article"]
+        self.assertEqual(opened, [aid(13), aid(12), aid(11)])
+        with self.assertRaises(ValueError):
+            self.jobs.submit("fetch_article", aid(14), "urgent")
+
+    def test_background_fetch_steps_aside(self):
+        self.fake.unopenable.add(aid(15))  # News never delivers this one: the job would wait it out
+        slow = self.jobs.submit("fetch_article", aid(15), "background")
+        deadline = time.time() + 5
+        while slow.state != "running" and time.time() < deadline:
+            time.sleep(0.005)
+        urgent = self.jobs.submit("fetch_article", aid(16), "interactive")
+        self.assertTrue(urgent.done.wait(10))
+        self.assertTrue(urgent.result["captured"])
+        self.assertFalse(slow.done.is_set())  # back in the queue, not failed
+        self.assertTrue(slow.done.wait(10))
+        self.assertFalse(slow.result["captured"])
+        opened = [c[1] for c in self.fake.calls if c[0] == "open_article"]
+        self.assertEqual(opened, [aid(15), aid(16), aid(15)])
+
+    def test_saved_prefetch_is_background(self):
+        self.get("/v1/saved?fetch_missing=true")
+        jobs = [j for j in self.jobs.list() if j.kind == "fetch_article" and j.target == aid(999)]
+        self.assertEqual([j.priority for j in jobs], ["background"])
 
     # --------------------------------------------------------- protocol
 

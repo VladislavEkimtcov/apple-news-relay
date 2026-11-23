@@ -244,7 +244,7 @@ def article_body(conn: sqlite3.Connection, store, row: sqlite3.Row, entitled: bo
     return {
         "blocks": blocks,
         "subtitle": converted.subtitle,
-        "byline": converted.byline,
+        "byline": anf.clean_byline(converted.byline, row["channel_name"]),
         "word_count": sum(len(b.get("text", "").split()) for b in blocks if "text" in b),
         "truncated": state == "preview",
         "removed": converted.removed,

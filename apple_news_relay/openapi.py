@@ -163,6 +163,7 @@ SCHEMAS = {
     "Job": {"type": "object", "properties": {"id": {"type": "string"}, "kind": {"type": "string",
             "enum": ["fetch_article", "open_tag", "refresh_today", "search"]}, "target": {"type": ["string", "null"]},
             "state": {"type": "string", "enum": ["queued", "running", "succeeded", "failed", "cancelled"]},
+            "priority": {"type": "string", "enum": ["interactive", "normal", "background"]},
             "result": {"type": ["object", "null"]}, "error": {"type": ["string", "null"]}}},
     "Status": {"type": "object"},
 }

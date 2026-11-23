@@ -147,5 +147,17 @@ class AnfTest(unittest.TestCase):
         self.assertEqual(cut[0]["type"], "image", "the lead picture stays")
 
 
+
+class BylineTest(unittest.TestCase):
+    def test_names_only(self):
+        from apple_news_relay.anf import clean_byline
+        self.assertEqual(clean_byline("by Dennis Romero | NBC NEWS", "NBC News"), "Dennis Romero")
+        self.assertEqual(clean_byline("By Ana Ruiz and Bo Li", "The Daily Example"), "Ana Ruiz and Bo Li")
+        self.assertEqual(clean_byline("Ana Ruiz, Reuters", "Reuters"), "Ana Ruiz")
+        self.assertEqual(clean_byline("Jean-Paul Sartre - Le Monde", "Le Monde"), "Jean-Paul Sartre")
+        self.assertEqual(clean_byline("Jean-Paul Sartre", "Paul"), "Jean-Paul Sartre")
+        self.assertEqual(clean_byline("NBC News", "NBC News"), "NBC News")
+        self.assertIsNone(clean_byline(None, "X"))
+
 if __name__ == "__main__":
     unittest.main()

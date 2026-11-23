@@ -357,9 +357,9 @@ class RelayApp:
             raise not_found(what, tag_id)
         return row
 
-    def submit(self, kind: str, target: Optional[str] = None, **params):
+    def submit(self, kind: str, target: Optional[str] = None, priority: str = "normal", **params):
         try:
-            return self.jobs.submit(kind, target, **params)
+            return self.jobs.submit(kind, target, priority, **params)
         except QueueFull:
             raise ApiError(429, "Too many requests", "The News job queue is full; try again shortly.",
                            headers={"Retry-After": "10"})
@@ -491,7 +491,7 @@ class RelayApp:
         fetch = req.choice("fetch", ["auto", "never"], "auto")
         job = None
         if not row["has_body"] and fetch == "auto":
-            job = self.submit("fetch_article", row["id"])
+            job = self.submit("fetch_article", row["id"], "interactive")
             self.wait_for(job, req)
             row = self.article_row(conn, row["id"])
         body = Q.article_detail(conn, self.store, row, self.entitled(), self.include_ads(req))
@@ -507,7 +507,7 @@ class RelayApp:
     def article_fetch(self, req: Request) -> Response:
         conn = self.store.read()
         row = self.article_row(conn, req.params["id"])
-        job = self.submit("fetch_article", row["id"])
+        job = self.submit("fetch_article", row["id"], "interactive")
         self.wait_for(job, req)
         return accepted(job.to_dict()) if not job.done.is_set() else Response(200, {"data": job.to_dict()})
 
@@ -678,9 +678,13 @@ class RelayApp:
             else:
                 missing.append(article_id)
         if missing and req.bool("fetch_missing", False):
+            # Prefetching: behind anything someone is waiting for, and never an error here.
             for article_id in missing:
                 if ARTICLE_ID.match(article_id):
-                    self.submit("fetch_article", article_id)
+                    try:
+                        self.jobs.submit("fetch_article", article_id, "background")
+                    except QueueFull:
+                        break
         return page(req, data, nxt, limit, missing_article_ids=missing)
 
     def saved(self, req: Request) -> Response:
@@ -727,7 +731,7 @@ class RelayApp:
         q = str(body.get("query") or req.get("q") or "").strip()
         if not q or len(q) > 120:
             raise bad_param("query", "required, at most 120 characters")
-        job = self.submit("search", q)
+        job = self.submit("search", q, "interactive")
         self.wait_for(job, req)
         payload = job.to_dict()
         payload["links"] = {"results": "/v1/search?" + urlencode({"q": q})}
