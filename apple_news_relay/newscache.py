@@ -395,30 +395,48 @@ def section_title(kind_id: str) -> str:
     return " ".join(special.get(w, w.capitalize()) for w in words) or kind_id
 
 
+#: Sections of an earlier feed stay on until a newer feed has them, for this long.
+CARRY_OVER = 36 * 3600
+
+
 def read_sections(paths: NewsPaths) -> List[Section]:
-    """Today feed sections from ``today-feed-db`` (SQLite), in feed order."""
+    """Today feed sections from ``today-feed-db`` (SQLite), in feed order.
+
+    Every refresh starts a new cursor, and News adds a section to it only once the feed scrolls
+    to that section on screen. A refresh while News can't be scrolled (its window on another
+    Space, say) leaves a cursor with Top Stories alone. So the newest cursor's sections come
+    first, then sections it doesn't have yet from the cursors before it (up to 36 hours older),
+    in their old order."""
     db = paths.today_feed_db
     if not os.path.exists(db):
         return []
     conn = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=5)
     try:
-        # The feed is rebuilt into a new cursor on every refresh; older cursors
-        # linger. The newest cursor that has groups is the feed on screen.
-        rows = conn.execute(
-            "SELECT g.id, g.kindId, g.kind, g.tagId, g.createdDate, g.itemIds FROM groups g "
-            "WHERE g.cursorId = (SELECT g2.cursorId FROM groups g2 JOIN cursors c ON c.id = g2.cursorId "
-            "ORDER BY c.createdDate DESC LIMIT 1) ORDER BY g.createdDate, g.rowid"
-        ).fetchall()
+        cursors = conn.execute(
+            "SELECT c.id, c.createdDate FROM cursors c WHERE EXISTS (SELECT 1 FROM groups g WHERE g.cursorId = c.id) "
+            "ORDER BY c.createdDate DESC LIMIT 8").fetchall()
+        groups = {cid: conn.execute(
+            "SELECT id, kindId, kind, tagId, createdDate, itemIds FROM groups WHERE cursorId = ? "
+            "ORDER BY createdDate, rowid", (cid,)).fetchall() for cid, _ in cursors}
     finally:
         conn.close()
-    out = []
-    for gid, kind_id, group_type, tag_id, created, items in rows:
-        try:
-            ids = json.loads(items if isinstance(items, str) else items.decode())
-        except Exception:
-            ids = []
-        out.append(Section(gid, kind_id or "", section_title(kind_id or gid), group_type or "", tag_id,
-                           created, [i for i in ids if isinstance(i, str)]))
+    out: List[Section] = []
+    seen = set()
+    newest = cursors[0][1] if cursors else None
+    for cid, created in cursors:
+        if newest is not None and created is not None and newest - created > CARRY_OVER:
+            break
+        for gid, kind_id, group_type, tag_id, g_created, items in groups[cid]:
+            key = (kind_id or gid, tag_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                ids = json.loads(items if isinstance(items, str) else items.decode())
+            except Exception:
+                ids = []
+            out.append(Section(gid, kind_id or "", section_title(kind_id or gid), group_type or "", tag_id,
+                               g_created, [i for i in ids if isinstance(i, str)]))
     return out
 
 

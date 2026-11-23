@@ -356,6 +356,16 @@ class ServiceTest(unittest.TestCase):
         opened = [c[1] for c in self.fake.calls if c[0] == "open_article"]
         self.assertEqual(opened, [aid(15), aid(16), aid(15)])
 
+    def test_client_prefetch_is_background(self):
+        gate = threading.Event()
+        original = self.fake.open_tag
+        self.fake.open_tag = lambda t: (gate.wait(5), original(t))
+        self.jobs.submit("open_tag", CH)  # holds the worker
+        status, body, _ = self.get("/v1/articles/%s/fetch?priority=background" % aid(20), "POST")
+        self.assertEqual((status, body["data"]["priority"]), (202, "background"))
+        self.assertEqual(self.get("/v1/articles/%s/fetch?priority=soon" % aid(20), "POST")[0], 400)
+        gate.set()
+
     def test_saved_prefetch_is_background(self):
         self.get("/v1/saved?fetch_missing=true")
         jobs = [j for j in self.jobs.list() if j.kind == "fetch_article" and j.target == aid(999)]
@@ -394,6 +404,18 @@ class ServiceTest(unittest.TestCase):
         h.check()
         h.check()
         self.assertIsNone(h.get())
+
+    def test_handoff_waits_on_a_story_the_relay_opened(self):
+        h, _ = self.handoff()
+        self.get("/v1/articles/%s/fetch?wait=10" % aid(9), "POST")  # a TV asked for it: News shows it now
+        self.jobs._last_action = 0  # long after the job
+        self.fake.front, self.fake.window = "com.apple.news", "Story number 9 about rivers - The Daily Example"
+        t = time.time()
+        h.check(now=t)
+        h.check(now=t + 4)
+        self.assertIsNone(h.get(now=t + 4), "a glance at what the relay left on screen")
+        h.check(now=t + 64)
+        self.assertEqual(h.get(now=t + 64)["article_id"], aid(9), "a minute in front is reading")
 
     def test_handoff_ignores_pages_that_are_not_stories(self):
         h, _ = self.handoff()

@@ -333,6 +333,7 @@ class JobRunner:
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._last_action = 0.0
+        self._opened: Dict[str, float] = {}  # stories the relay opened in News, and when
 
     # ------------------------------------------------------------ submit
 
@@ -403,6 +404,17 @@ class JobRunner:
         if self._thread:
             self._thread.join(timeout)
 
+    def opened_recently(self, article_id: str, within: float = 1800.0) -> bool:
+        """The relay itself opened this story in News lately (to fetch or save it for someone)."""
+        return time.time() - self._opened.get(article_id, 0) < within
+
+    def _open(self, article_id: str):
+        self._opened[article_id] = time.time()
+        if len(self._opened) > 500:
+            for k, _ in sorted(self._opened.items(), key=lambda kv: kv[1])[:100]:
+                self._opened.pop(k, None)
+        self.app.open_article(article_id)
+
     def busy(self, settle: float = 4.0) -> bool:
         """A job is driving News, or did a moment ago (what News shows is then the relay's doing)."""
         running = any(j.state == "running" for j in list(self._jobs.values()))
@@ -415,7 +427,9 @@ class JobRunner:
                 return
             if job.state != "queued":
                 continue
-            gap = self.min_gap - (time.time() - self._last_action)
+            # Someone waiting on it goes almost at once; prefetching and refreshes keep their distance.
+            gap = (min(self.min_gap, 0.25) if job.priority == "interactive" else self.min_gap) \
+                - (time.time() - self._last_action)
             if gap > 0:
                 time.sleep(gap)
             job.state, job.started_at = "running", time.time()
@@ -453,15 +467,17 @@ class JobRunner:
         """Harvests until ``predicate`` holds or ``timeout`` passes. ``yielding``: raise
         :class:`Yielded` as soon as an interactive job is queued."""
         timeout *= self.pace
-        poll *= self.pace
-        deadline = time.time() + timeout
+        start = time.time()
+        deadline = start + timeout
         while time.time() < deadline:
             self.harvester.run_once()
             if predicate():
                 return True
             if yielding and self._urgent_waiting():
                 raise Yielded()
-            time.sleep(poll)
+            # News usually writes a story within a second: look often at first (a pass costs a few
+            # ms when nothing changed), then settle to ``poll``.
+            time.sleep((0.15 if time.time() - start < 4 else poll) * self.pace)
         self.harvester.run_once()
         return predicate()
 
@@ -483,7 +499,7 @@ class JobRunner:
         if self._has_body(article_id):
             return {"captured": True, "already_cached": True}
         start = time.time()
-        self.app.open_article(article_id)
+        self._open(article_id)
         ok = self._wait_for(lambda: self._has_body(article_id), self.timeouts["fetch_article"],
                             yielding=job.priority == "background")
         return {"captured": ok, "seconds": round(time.time() - start, 1)}
@@ -568,14 +584,14 @@ class JobRunner:
         if not titles:
             raise ActuatorError("the relay doesn't know this story's title yet")
         start = time.time()
-        self.app.open_article(article_id)
+        self._open(article_id)
         deadline = start + self.timeouts["story_action"] * self.pace
         state = None
         while time.time() < deadline:
             state = self.app.story_state()
             if state.saved is not None and state.shows(titles):
                 break
-            self._sleep(0.7)
+            self._sleep(0.3)
         else:
             if state is not None and len(state.windows) > 1:
                 raise ActuatorError("News has %d windows open; close all but one" % len(state.windows))
@@ -586,8 +602,8 @@ class JobRunner:
         changed = before != want
         if changed:
             self.app.press_file_item(item)
-            for _ in range(6):
-                self._sleep(0.5)
+            for _ in range(12):
+                self._sleep(0.25)
                 state = self.app.story_state()
                 if getattr(state, key) == want:
                     break

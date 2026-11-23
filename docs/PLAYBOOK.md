@@ -9,7 +9,7 @@ storefront, no Apple News+), first by hand while watching the screen, then by
 
 | Action | How the relay does it | What lands in the cache | Time | Focus |
 |---|---|---|---|---|
-| Open a story | `open -g applenewss://apple.news/<A…>` | the story's ANF body (also for Apple News+ stories the account can't read) | 1–13 s | stays where it was |
+| Open a story | `open -g applenewss://apple.news/<A…>` | the story's ANF body (also for Apple News+ stories the account can't read) | usually 0.2–0.3 s to the body on disk; up to 13 s | stays where it was |
 | Open a channel or topic | `open -g applenewss://apple.news/<T…>` | ~50–85 article records for it, bodies of its first 3 stories, a few tags | 10–35 s | stays |
 | Refresh Today | AX: press "Today" in the sidebar, menu View › Check for New Stories | a new feed cursor; For You and other groups rebuilt; **old records pruned** (1,251 → 734 in one refresh) | 20–30 s | stays |
 | Scroll Today | AX: `AXScrollDownByPage` on an element of the feed, N times | more groups (topic, channel, magazine), records and bodies: 12 pages gave +418 records, +50 bodies | ~1 s a page | **News comes forward**; the relay puts the previous app back |
@@ -27,6 +27,10 @@ storefront, no Apple News+), first by hand while watching the screen, then by
   (by description: "Today", "Saved Stories", …) and every story card (description: publisher,
   "Apple News Plus", headline, age). Coordinates aren't needed.
 - Right after a story or channel opens, News may briefly have no window; scripts wait for one.
+- A Today refresh starts a new feed cursor, and News adds a section to it only as the feed
+  scrolls to that section on screen. A refresh that couldn't scroll left Top Stories alone, and
+  the relay showed only that; it now keeps the earlier cursor's sections (up to 36 hours old)
+  after the newest one's until a newer feed has them.
 - While someone works on the Mac with News on another Space, System Events lists **no** News
   windows at all, so the feed can't be pressed or scrolled; the menu bar still works. A Today
   refresh then only clicks Check for New Stories (`feed_reached: false` in its result).

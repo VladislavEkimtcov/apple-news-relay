@@ -95,6 +95,18 @@ class CacheReaderTest(unittest.TestCase):
         self.assertEqual(sections[0].article_ids, [A2, A1])
         self.assertTrue(sections[2].promotional)
 
+    def test_sections_of_a_sparse_refresh_keep_the_earlier_ones(self):
+        self.news.write_feed([{"kindId": "TOP_STORIES:DEFAULT", "items": [A1]},
+                              {"kindId": "EXTERNAL:FOR_YOU", "kind": "forYou", "items": [A1]},
+                              {"kindId": "EXTERNAL:TRENDING", "kind": "trending", "items": [A2]}],
+                             cursor="FULL", created=NOW - 3600)
+        self.news.write_feed([{"kindId": "TOP_STORIES:DEFAULT", "items": [A2]}], cursor="SPARSE", created=NOW)
+        sections = nc.read_sections(self.news.paths)
+        self.assertEqual([s.title for s in sections], ["Top Stories", "For You", "Trending"])
+        self.assertEqual(sections[0].article_ids, [A2], "the newest Top Stories")
+        self.news.write_feed([{"kindId": "TOP_STORIES:DEFAULT", "items": [A1]}], cursor="ANCIENT", created=NOW - 90 * 3600)
+        self.assertEqual(len(nc.read_sections(self.news.paths)), 3, "a feed days old doesn't come back")
+
     def test_entitlement(self):
         self.assertFalse(nc.read_entitlement(self.news.paths).news_plus)
         self.news.write_entitlement(True)

@@ -4,8 +4,9 @@ While News is the frontmost app, its front window's title ("<headline> - <publis
 story on screen. The watcher checks every few seconds (``lsappinfo`` first, ~15 ms, and the window
 title only while News is in front), matches the title to the archive, and publishes a
 ``handoff.updated`` event when the story changes. A story counts once it has been on screen for
-two checks in a row while no relay job was driving News, so stories the relay opens to fetch them
-are never offered. The last story stays on offer for half an hour.
+two checks in a row while no relay job was driving News. A story the relay itself opened in the
+last half hour (for a TV, say) counts only after a minute in front: a glance at News showing what
+the relay left there isn't reading it. The last story stays on offer for half an hour.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ class Handoff:
         self.current: Optional[dict] = None   # {article_id, since, seen_at}
         self.on_screen = False
         self._candidate: Optional[str] = None
+        self._candidate_since = 0.0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -77,11 +79,14 @@ class Handoff:
         article_id = self.match(self.app.front_window_title())
         if article_id is None or article_id != self._candidate:
             self._candidate = article_id   # needs a second look before it counts
+            self._candidate_since = now
             self.on_screen = bool(article_id and self.current and self.current["article_id"] == article_id)
             if was_on_screen != self.on_screen and self.current:
                 self.on_event("handoff.updated", self._event())
             return
         changed = self.current is None or self.current["article_id"] != article_id
+        if changed and self.jobs.opened_recently(article_id) and now - self._candidate_since < 60:
+            return  # the relay put it there; wait to see that someone stays with it
         if changed:
             self.current = {"article_id": article_id, "since": now, "seen_at": now}
         self.current["seen_at"] = now

@@ -514,7 +514,8 @@ class RelayApp:
     def article_fetch(self, req: Request) -> Response:
         conn = self.store.read()
         row = self.article_row(conn, req.params["id"])
-        job = self.submit("fetch_article", row["id"], "interactive")
+        priority = req.choice("priority", ["interactive", "normal", "background"], "interactive")
+        job = self.submit("fetch_article", row["id"], priority)
         self.wait_for(job, req)
         return accepted(job.to_dict()) if not job.done.is_set() else Response(200, {"data": job.to_dict()})
 

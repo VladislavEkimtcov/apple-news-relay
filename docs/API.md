@@ -78,7 +78,13 @@ job):
 - `interactive`: someone is waiting on it: a story opened with `GET /v1/articles/{id}`, a fetch,
   a search.
 - `normal`: refreshes of Today, sections, channels and topics.
-- `background`: prefetching, such as `/v1/saved?fetch_missing=true`.
+- `background`: prefetching, such as `/v1/saved?fetch_missing=true` or
+  `POST /v1/articles/{id}/fetch?priority=background` (a client guessing what will be opened
+  next). A background fetch steps aside as soon as an interactive job is queued.
+
+Interactive jobs start within 0.25 s of the last News action, the others keep 1.5 s apart. A
+fetch looks for the body every 0.15 s for its first 4 s: a story News already has opens in
+about half a second.
 
 - `POST` endpoints that start a job answer `202 Accepted` with the job and a `Location` header
   (`/v1/jobs/{id}`), or `200` with the finished job if it completed within `wait`.
@@ -142,7 +148,8 @@ it:
 an hour after it was last on screen; then `data` is `null`. The relay watches every 4 s (the
 frontmost app with `lsappinfo`, and News's window title only while News is in front), counts a
 story after two looks in a row, and ignores what's on screen while one of its own jobs is driving
-News. Each change is also a `handoff.updated` event. Start the relay with `--no-handoff` to turn
+News. A story the relay itself opened in the last half hour (to fetch it for a client) counts only
+after a minute in front. Each change is also a `handoff.updated` event. Start the relay with `--no-handoff` to turn
 the watching off.
 
 ## Events
@@ -158,6 +165,13 @@ data: {"count": 37, "ids": ["A…", …], "seq": 17, "at": "2026-11-23T07:01:12Z
 
 Events: `articles.added`, `article.body_captured`, `sections.updated`, `saved.updated`,
 `handoff.updated`, `job.updated`. A comment line every 15 s keeps proxies from closing the connection.
+
+## Today
+
+`GET /v1/sections` follows News's Today feed. Each refresh in News starts the feed afresh and adds
+sections only as they scroll onto the screen, so a refresh that couldn't scroll (News's window on
+another Space) has Top Stories alone. The relay then keeps the sections of the feed before it, up
+to 36 hours old, after the new ones, until a newer feed has them again.
 
 ## History
 
