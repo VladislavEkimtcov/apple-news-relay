@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "apple-news-relay"
+dynamic = ["version"]
+description = "A local REST API for Apple News on macOS: Today, full articles, channels, saved stories and search as JSON, with ad filtering."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [{ name = "Vladislav Ekimtcov" }]
+keywords = ["apple news", "apple news api", "news api", "rest api", "macos", "rss alternative", "news reader", "self-hosted"]
+classifiers = [
+  "Environment :: MacOS X",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+]
+
+[project.urls]
+Homepage = "https://github.com/VladislavEkimtcov/apple-news-relay"
+
+[project.scripts]
+apple-news-relay = "apple_news_relay.__main__:main"
+
+[tool.setuptools]
+packages = ["apple_news_relay"]
+
+[tool.setuptools.dynamic]
+version = { attr = "apple_news_relay.__version__" }
