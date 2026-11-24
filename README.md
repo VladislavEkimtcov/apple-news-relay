@@ -181,8 +181,9 @@ macOS asks once, the first time, for the permissions above for `python3`. Logs g
 
 ## Clients
 
-- [Broadsheet](https://github.com/VladislavEkimtcov/broadsheet-news-tv): an Android TV / Fire TV
-  news reader built on this API (D-pad only, finds the relay by itself).
+- [Broadsheet](https://github.com/VladislavEkimtcov/broadsheet): Apple News on Android phones,
+  Fire TV / Android TV / Google TV and Windows, built on this API (finds the relay by itself;
+  [downloads](https://github.com/VladislavEkimtcov/broadsheet/releases/latest)).
 - Anything that speaks HTTP: `curl`, a home dashboard, a script that emails you Top Stories, an
   e-ink display.
 
