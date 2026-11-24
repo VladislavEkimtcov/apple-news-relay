@@ -171,9 +171,13 @@ the way a publisher shows a lede before its paywall.
 ## Run it as a service
 
 ```sh
-./launchd/install.sh --host 0.0.0.0 --allow 127.0.0.1,192.168.1.0/24   # starts at login, restarts if it stops
+./launchd/install.sh --persistent --host 0.0.0.0 --allow 127.0.0.1,192.168.1.0/24   # starts now and at login, restarts if it stops
+./launchd/install.sh --restart   # relaunch it, e.g. after pulling or editing the code (it runs this checkout)
+./launchd/install.sh --status
 ./launchd/install.sh --undo
 ```
+
+Stop a relay you started in a terminal first: both want port 8787.
 
 macOS asks once, the first time, for the permissions above for `python3`. Logs go to
 `~/Library/Logs/apple-news-relay.log`; the archive lives in
