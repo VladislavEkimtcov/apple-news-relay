@@ -237,8 +237,9 @@ when a body arrives.
 ## Today
 
 `GET /v1/sections` follows News's Today feed. Each refresh in News starts the feed afresh and adds
-sections only as they scroll onto the screen, so a refresh that couldn't scroll (News's window on
-another Space) has Top Stories alone. The relay then keeps the sections of the feed before it, up
+sections only as they scroll onto the screen. When News's window is out of reach (on another Space,
+or full screen), a refresh opens one here with File > New Window (News stays in the background);
+if that fails too, the refresh can't scroll and has Top Stories alone. The relay then keeps the sections of the feed before it, up
 to 36 hours old, after the new ones, until a newer feed has them again.
 
 ### Deep sections

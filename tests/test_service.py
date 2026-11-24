@@ -95,6 +95,9 @@ class FakeNewsApp(NewsApp):
     def show_today(self):
         self.calls.append(("show_today",))
 
+    def new_window(self):
+        self.calls.append(("new_window",))
+
     def check_for_new_stories(self):
         self.calls.append(("check",))
         self.news.add_article(aid(900), "Fresh story", CH, published=NOW + 60)
@@ -306,6 +309,21 @@ class ServiceTest(unittest.TestCase):
         self.assertFalse(body["data"]["result"]["feed_reached"])
         self.assertIn(("check",), self.fake.calls)
         self.assertNotIn(("scroll", 3), self.fake.calls)
+
+    def test_refresh_opens_a_window_when_news_has_none_here(self):
+        from apple_news_relay.actuator import ActuatorError
+        fake = self.fake
+
+        def show_today():
+            if ("new_window",) not in fake.calls:
+                raise ActuatorError("News has no window")
+            fake.calls.append(("today",))
+        fake.show_today = show_today
+        status, body, _ = self.get("/v1/today/refresh?pages=3&wait=10", "POST")
+        self.assertEqual(body["data"]["state"], "succeeded")
+        self.assertTrue(body["data"]["result"]["feed_reached"])
+        self.assertIn(("new_window",), fake.calls)
+        self.assertIn(("scroll", 3), fake.calls)
 
     def test_async_job_and_polling(self):
         status, body, resp = self.get("/v1/channels/%s/refresh" % CH2, "POST")

@@ -219,6 +219,13 @@ class NewsApp:
                     pass  # sidebar already showing
                 time.sleep(1.5)
 
+    def new_window(self):
+        """File > New Window: a News window on this Space. News's own window can sit on another
+        Space (or full screen), where Accessibility can't see it; the menu works from anywhere and
+        doesn't bring News to the front."""
+        self._cmd(["osascript", "-e", 'tell application "System Events" to tell process "News" to click menu item '
+                   '"New Window" of menu 1 of menu bar item "File" of menu bar 1'], 10)
+
     def check_for_new_stories(self):
         self._cmd(["osascript", "-e", 'tell application "System Events" to tell process "News" to click menu item '
                    '"Check for New Stories" of menu 1 of menu bar item "View" of menu bar 1'], 20)
@@ -699,10 +706,21 @@ class JobRunner:
             self.app.show_today()
             window = True
         except ActuatorError as e:
-            # News's window is out of Accessibility's reach (on another Space while someone uses
-            # the Mac): the menu still works, scrolling the feed doesn't.
-            log.info("refresh without the feed: %s", e)
             window = False
+            if "no window" in str(e):
+                # News's window is out of Accessibility's reach (on another Space, or full screen):
+                # open one here, so the feed can be scrolled and every section comes in.
+                try:
+                    self.app.new_window()
+                    self._sleep(3)
+                    self.app.show_today()
+                    window = True
+                    log.info("refresh: News had no window here; opened one")
+                except ActuatorError as e2:
+                    e = e2
+            if not window:
+                # The menu still works, scrolling the feed doesn't.
+                log.info("refresh without the feed: %s", e)
         self._sleep(1)
         self.app.check_for_new_stories()
         self._sleep(4)
