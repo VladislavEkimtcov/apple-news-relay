@@ -60,9 +60,175 @@ function find(e, d, test) {
 const news = Application("System Events").processes.byName("News");
 let win = null;
 for (let i = 0; i < 24 && win === null; i++) {  // News swaps its window while opening some pages
-  try { win = news.windows[0]; win.name(); } catch (x) { win = null; delay(0.5); }
+  try { win = news.windows[0]; win.name(); }
+  catch (x) { if (/-1719|-25211|assistive/i.test(String(x))) throw x; win = null; delay(0.5); }
 }
 if (win === null) throw new Error("News has no window");
+"""
+
+# Accessibility refused: retrying or waiting won't help, so these fail at once.
+ASSISTIVE = re.compile(r"-1719|-25211|assistive access", re.I)
+
+# Page News's feed. __ARGS__ is {"pages", "pause", "path": [[cls, idx], ...] | null, "dir", "force"};
+# prints {n, via: cache|scan|card|none, path, find_ms, total_ms, scanned, elements}. The page's own
+# scroll area is preferred (its path survives scrolling, so it's remembered); a story card is the
+# fallback (cells are reused, so a card's path isn't). Measured on 2026-11-25: ~1 s to find by scan,
+# ~0.5 s with the remembered path; the old depth-first walk took 27.5 s and found nothing.
+SCROLL_JS = r"""
+const A = __ARGS__;
+const T0 = Date.now();
+const news = Application("System Events").processes.byName("News");
+let win = null;
+for (let i = 0; i < 24 && win === null; i++) {  // News swaps its window while opening some pages
+  try { win = news.windows[0]; win.name(); }
+  catch (x) { if (/-1719|-25211|assistive/i.test(String(x))) throw x; win = null; delay(0.5); }  // no access: say so now
+}
+if (win === null) throw new Error("News has no window");
+// Paths are [[class, index], ...] from the window down, read off `entire contents` (one Apple Event
+// for the whole tree). Each attribute read costs an event that re-resolves the path, so read
+// whole sibling collections at once (kids.description()) rather than one element at a time.
+const TAIL = /((?:\.[A-Za-z]+\.at\(\d+\))+)$/, SEG = /\.([A-Za-z]+)\.at\((\d+)\)/g;
+function toPath(str) {
+  const p = [...(str.match(TAIL) || ["", ""])[1].matchAll(SEG)].map(m => [m[1], +m[2]]);
+  return p.length && p[0][0] === "windows" ? p.slice(1) : p;
+}
+function spec(path) { let s = win; for (const [c, i] of path) s = s[c][i]; return s; }
+const wp = win.position(), ws = win.size();
+const W = {x: wp[0], y: wp[1], w: ws[0], h: ws[1]};
+const DIR = A.dir || "AXScrollDownByPage";
+function visible(p, s) {
+  const w = Math.min(p[0] + s[0], W.x + W.w) - Math.max(p[0], W.x);
+  const h = Math.min(p[1] + s[1], W.y + W.h) - Math.max(p[1], W.y);
+  return w > 0 && h > 0 ? w * h : 0;
+}
+// A pageable scroll area: has the action, top-left inside the window, covers >= 1/4 of it.
+function pageable(e) {
+  const p = e.position();
+  if (!visible(p, [1, 1]) || visible(p, e.size()) < 0.25 * W.w * W.h) return false;
+  return e.actions.name().includes(DIR);
+}
+let target = null, path = null, via = "none", scanned = 0, elements = 0;
+if (A.path && !A.force) {
+  try { const e = spec(A.path); if (e.role() === "AXScrollArea" && pageable(e)) { target = e; path = A.path; via = "cache"; } }
+  catch (x) {}
+}
+if (!target) {
+  let strs = [];
+  try { strs = win.entireContents().map(e => Automation.getDisplayString(e)); } catch (x) {}  // one Apple Event
+  elements = strs.length;
+  if (A.force !== "cards") {
+    const areas = strs.filter(s => /\.scrollAreas\.at\(\d+\)$/.test(s)).map(toPath)
+                      .sort((a, b) => a.length - b.length);  // the page's scroller before carousels inside it
+    for (const p of areas) {
+      scanned++;
+      try { const e = spec(p); if (pageable(e)) { target = e; path = p; via = "scan"; break; } } catch (x) {}
+    }
+  }
+  if (!target) {
+    // No pageable scroll area: page through a story card or section header right of the sidebar.
+    // Read role/description/position of all siblings at once (3 Apple Events per parent).
+    const left = W.x + 330, parents = new Map();
+    for (const s of strs) {
+      if (!/\.uiElements\.at\(\d+\)$/.test(s)) continue;
+      const p = toPath(s).slice(0, -1);
+      parents.set(JSON.stringify(p), p);
+    }
+    outer: for (const p of parents.values()) {
+      if (scanned >= 30) break;
+      scanned++;
+      try {
+        const kids = spec(p).uiElements;
+        const roles = kids.role(), descs = kids.description(), pos = kids.position();
+        for (let i = 0; i < roles.length; i++) {
+          const d = descs[i] || "";
+          if (roles[i] !== "AXGenericElement" || d.length <= 20 || /^Advertisement/.test(d)) continue;
+          if (pos[i][0] <= left || !visible(pos[i], [1, 1])) continue;
+          if (kids[i].actions.name().includes(DIR)) { target = kids[i]; via = "card"; break outer; }
+        }
+      } catch (x) {}
+    }
+  }
+}
+const findMs = Date.now() - T0;
+let n = 0;
+if (target) {
+  for (let i = 0; i < Math.min(A.pages, 40); i++) {
+    try { target.actions.byName(DIR).perform(); n++; } catch (x) { break; }
+    if (i < A.pages - 1) delay(A.pause);
+  }
+}
+JSON.stringify({n, via, path: via === "card" ? null : path, find_ms: findMs, total_ms: Date.now() - T0, scanned, elements});
+"""
+
+# Find the sidebar's "Today" row and press it. __ARGS__ is {"path": ... | null, "press": bool, "ups": int};
+# prints {pressed, found, via, path, pages_up, ms}. The sidebar only lists rows on screen, so when
+# Today isn't there it pages the sidebar up (up to "ups" times) and looks again.
+TODAY_JS = r"""
+const A = __ARGS__;
+const T0 = Date.now();
+const news = Application("System Events").processes.byName("News");
+let win = null;
+for (let i = 0; i < 24 && win === null; i++) {  // News swaps its window while opening some pages
+  try { win = news.windows[0]; win.name(); }
+  catch (x) { if (/-1719|-25211|assistive/i.test(String(x))) throw x; win = null; delay(0.5); }  // no access: say so now
+}
+if (win === null) throw new Error("News has no window");
+// Paths are [[class, index], ...] from the window down, read off `entire contents` (one Apple Event
+// for the whole tree). Each attribute read costs an event that re-resolves the path, so read
+// whole sibling collections at once (kids.description()) rather than one element at a time.
+const TAIL = /((?:\.[A-Za-z]+\.at\(\d+\))+)$/, SEG = /\.([A-Za-z]+)\.at\((\d+)\)/g;
+function toPath(str) {
+  const p = [...(str.match(TAIL) || ["", ""])[1].matchAll(SEG)].map(m => [m[1], +m[2]]);
+  return p.length && p[0][0] === "windows" ? p.slice(1) : p;
+}
+function spec(path) { let s = win; for (const [c, i] of path) s = s[c][i]; return s; }
+function rowParents() {  // parents of generic rows, in document order (the sidebar comes first)
+  const parents = new Map();
+  let strs = [];
+  try { strs = win.entireContents().map(e => Automation.getDisplayString(e)); } catch (x) {}
+  for (const s of strs) {
+    if (!/\.uiElements\.at\(\d+\)$/.test(s)) continue;
+    const p = toPath(s).slice(0, -1);
+    parents.set(JSON.stringify(p), p);
+  }
+  return [...parents.values()];
+}
+function look(parents) {
+  for (const p of parents) {
+    try {
+      const d = spec(p).uiElements.description();  // all siblings in one Apple Event
+      const i = d.indexOf("Today");
+      if (i >= 0) return p.concat([["uiElements", i]]);
+    } catch (x) {}
+  }
+  return null;
+}
+let path = null, via = "none", up = 0;
+if (A.path) { try { if (spec(A.path).description() === "Today") { path = A.path; via = "cache"; } } catch (x) {} }
+if (!path) {
+  let parents = rowParents();
+  path = look(parents); if (path) via = "scan";
+  // The sidebar only lists rows on screen: page it up until Today is back.
+  const left = win.position()[0] + 330;
+  for (; !path && up < (A.ups || 0) && parents.length; up++) {
+    let moved = false;
+    for (const p of parents) {
+      try {
+        const kids = spec(p).uiElements, pos = kids.position();
+        const i = pos.findIndex(q => q[0] < left);
+        if (i < 0) continue;
+        kids[i].actions.byName("AXScrollUpByPage").perform(); moved = true; break;
+      } catch (x) {}
+    }
+    if (!moved) break;
+    delay(0.5);
+    parents = rowParents();
+    path = look(parents); if (path) via = "scan_after_up";
+  }
+}
+let pressed = false;
+if (path && A.press) { spec(path).actions.byName("AXPress").perform(); pressed = true; }
+JSON.stringify({pressed, found: !!path, via, path, pages_up: up, ms: Date.now() - T0});
 """
 
 
@@ -141,14 +307,31 @@ class StoryState:
 class NewsApp:
     """Low-level control of News.app. Every method is synchronous."""
 
+    RETRY_WAIT = 3.0  # the feed may still be loading after a refresh
+    SIDEBAR_WAIT = 1.5
+
     def __init__(self, runner: Callable[..., subprocess.CompletedProcess] = subprocess.run):
         self._run = runner
+        # Where the feed's scroll area and the sidebar's Today row were last time: checked in one
+        # Apple Event instead of a scan. In memory only; a scan costs about a second.
+        self._feed_path: Optional[list] = None
+        self._today_path: Optional[list] = None
 
     def _cmd(self, args: List[str], timeout: float = 60) -> str:
         proc = self._run(args, capture_output=True, text=True, timeout=timeout)
         if proc.returncode != 0:
             raise ActuatorError((proc.stderr or proc.stdout or "command failed").strip()[:300])
         return (proc.stdout or "").strip()
+
+    def _jxa_json(self, template: str, args: dict, timeout: float) -> dict:
+        out = self._cmd(["osascript", "-l", "JavaScript", "-e", template.replace("__ARGS__", json.dumps(args))], timeout)
+        try:
+            data = json.loads(out)
+        except ValueError:
+            raise ActuatorError("not JSON from News: %s" % out[:200])
+        if not isinstance(data, dict):
+            raise ActuatorError("not JSON from News: %s" % out[:200])
+        return data
 
     def jxa(self, body: str, timeout: float = 90) -> str:
         return self._cmd(["osascript", "-l", "JavaScript", "-e", FIND_JS + body], timeout)
@@ -206,18 +389,25 @@ class NewsApp:
         and the sidebar may be hidden, so look again a few times."""
         for attempt in range(attempts):
             try:
-                self.jxa('const t = find(win, 0, (r, d) => d === "Today"); '
-                         'if (!t) throw new Error("Today not found"); t.actions.byName("AXPress").perform(); "ok"')
-                return
-            except ActuatorError:
-                if attempt == attempts - 1:
+                r = self._jxa_json(TODAY_JS, {"path": self._today_path, "press": True, "ups": 3}, 30)
+                if r.get("pressed"):
+                    self._today_path = r.get("path")
+                    return
+                self._today_path = None
+                err: Exception = ActuatorError("Today not found")
+            except ActuatorError as e:
+                self._today_path = None
+                if ASSISTIVE.search(str(e)):
                     raise
-                try:
-                    self._cmd(["osascript", "-e", 'tell application "System Events" to tell process "News" to '
-                               'click menu item "Show Sidebar" of menu 1 of menu bar item "View" of menu bar 1'], 10)
-                except ActuatorError:
-                    pass  # sidebar already showing
-                time.sleep(1.5)
+                err = e
+            if attempt == attempts - 1:
+                raise err
+            try:
+                self._cmd(["osascript", "-e", 'tell application "System Events" to tell process "News" to '
+                           'click menu item "Show Sidebar" of menu 1 of menu bar item "View" of menu bar 1'], 10)
+            except ActuatorError:
+                pass  # sidebar already showing
+            time.sleep(self.SIDEBAR_WAIT)
 
     def new_window(self):
         """File > New Window: a News window on this Space. News's own window can sit on another
@@ -231,30 +421,34 @@ class NewsApp:
                    '"Check for New Stories" of menu 1 of menu bar item "View" of menu bar 1'], 20)
 
     def scroll_feed(self, pages: int = 6, pause: float = 0.8, attempts: int = 2) -> int:
-        """Page down the feed through Accessibility. The page is scrolled through any described
-        element right of the sidebar (a story card or a section header). Returns pages scrolled."""
-        script = (
-            'const left = win.position()[0] + 330; '
-            'const c = find(win, 0, (r, d, k) => r === "AXGenericElement" && d.length > 20 && '
-            '(() => { try { return k.position()[0] > left; } catch (x) { return false; } })()); let n = 0; '
-            'if (c) { for (let i = 0; i < %d; i++) { try { c.actions.byName("AXScrollDownByPage").perform(); n++; '
-            'delay(%s); } catch (x) { break; } } } String(n)' % (max(1, min(pages, 40)), pause))
+        """Page down the feed through Accessibility: its scroll area (path remembered), else a story
+        card right of the sidebar. Returns pages scrolled; 0 (not an error) when it couldn't."""
+        pages = max(1, min(pages, 40))
+        timeout = 15 + pages * (pause + 1.0)
         for attempt in range(attempts):
-            scrolled = int(self.jxa(script, timeout=30 + pages * 3) or 0)
-            if scrolled or attempt == attempts - 1:
-                return scrolled
-            time.sleep(3)  # the feed may still be loading after a refresh
+            try:
+                r = self._jxa_json(SCROLL_JS, {"pages": pages, "pause": pause, "path": self._feed_path,
+                                               "dir": "AXScrollDownByPage"}, timeout)
+            except subprocess.TimeoutExpired:
+                log.warning("scroll: no answer from News in %.0f s", timeout)
+                self._feed_path = None
+                return 0
+            except ActuatorError as e:
+                if ASSISTIVE.search(str(e)) or "no window" in str(e):
+                    raise
+                log.info("scroll: %s", e)
+                r = {"n": 0, "via": "none"}
+            n = int(r.get("n") or 0)
+            log.info("scroll: %d page(s) via %s, found in %s ms (%s elements)", n, r.get("via"), r.get("find_ms"),
+                     r.get("elements"))
+            if n and r.get("via") in ("cache", "scan") and r.get("path"):
+                self._feed_path = r["path"]
+            elif not n:
+                self._feed_path = None
+            if n or attempt == attempts - 1:
+                return n
+            time.sleep(self.RETRY_WAIT)
         return 0
-
-    def visible_stories(self) -> List[str]:
-        """Accessibility descriptions of the story cards on screen (publisher, flags, headline, age)."""
-        out = self.jxa(
-            'const out = []; function walk(e, d) { if (d > 28 || out.length > 80) return; let kids = []; '
-            'try { kids = e.uiElements(); } catch (x) { return; } for (const k of kids) { let r = "", s = ""; '
-            'try { r = k.role(); s = k.description() || ""; } catch (x) {} '
-            'if (r === "AXGenericElement" && / ago$/.test(s)) out.push(s); walk(k, d + 1); } } '
-            'walk(win, 0); out.join("\\n")')
-        return [line for line in out.splitlines() if line]
 
     def story_state(self) -> StoryState:
         """The open story's Save and Suggest items, read from the menu bar (works while News is in

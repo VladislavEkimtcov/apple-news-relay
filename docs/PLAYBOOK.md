@@ -12,12 +12,24 @@ storefront, no Apple News+), first by hand while watching the screen, then by
 | Open a story | `open -g applenewss://apple.news/<A…>` | the story's ANF body (also for Apple News+ stories the account can't read) | usually 0.2–0.3 s to the body on disk; up to 13 s | stays where it was |
 | Open a channel or topic | `open -g applenewss://apple.news/<T…>` | ~50–85 article records for it, bodies of its first 3 stories, a few tags | 10–35 s | stays |
 | Refresh Today | AX: press "Today" in the sidebar, menu View › Check for New Stories | a new feed cursor; For You and other groups rebuilt; **old records pruned** (1,251 → 734 in one refresh) | 20–30 s | stays |
-| Scroll Today | AX: `AXScrollDownByPage` on an element of the feed, N times | more groups (topic, channel, magazine), records and bodies: 12 pages gave +418 records, +50 bodies | ~1 s a page | **News comes forward**; the relay puts the previous app back |
+| Scroll Today | AX: `AXScrollDownByPage` on the feed's scroll area, N times. Found with one `entire contents` Apple Event (~0.5 s), its path remembered between refreshes; a story card is the fallback | more groups (topic, channel, magazine), records and bodies: 12 pages gave +418 records, +50 bodies | ~0.5 s to find, then ~1 s a page | News stayed in the background (2026-11-25, 4 scrolls); the relay puts the previous app back anyway |
 | Search | keystrokes: ⌘F, ⌘A, query, Return | records for the results, bodies of the first 8 results, matching topics and channels | ~6 s | needs News in front for a moment |
 | Save, like, dislike a story | open it, then menu File › Save Story / Unsave Story, Suggest More / Fewer Stories Like This | the change itself (Saved Stories syncs through iCloud) | 2.2–2.4 s | stays |
 | Nothing | — | News refreshes on its own when it's in front; the cache shrinks over time | — | — |
 
 ## Things that don't work
+
+- **Walking News's tree element by element.** Accessibility costs one Apple Event per attribute read,
+  and each re-resolves the element's path from the window: ~20 ms at the window, 55–100 ms at
+  depth 20–25. A depth-first search reading role and description per element took 27.5 s for ~200
+  elements (the old Today press and scroll timed out at 36–42 s). `entire contents` returns every
+  element's path and class in one event (0.25–0.5 s), and `kids.description()` reads all siblings
+  at once (27 sidebar rows: 74 ms against 2.2 s). Today press now 0.3–0.6 s, find-and-scroll 2
+  pages 1.4 s. App Nap isn't the cause: 80–84 ms per event warm and after 2 minutes idle.
+- **The sidebar only lists rows on screen.** Scrolled down, "Today" isn't in the tree at all;
+  `AXScrollUpByPage` on a sidebar row brings it back.
+- **A story page's outer content scroll area can't page** (no `AXScrollDownByPage`); the story's
+  own scroller inside it can. On Today the feed's scroll area (depth 14) pages directly.
 
 - There is no URL for Today or for a search (`applenewss://apple.news/search?q=…` does nothing,
   `applenews://` alone does nothing).
