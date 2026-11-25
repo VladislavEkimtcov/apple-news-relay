@@ -70,6 +70,11 @@ The relay needs two things from macOS, both granted to whatever runs it (Termina
 
 Reading works without the second; only jobs need it. `doctor` tells you what's missing.
 
+Run by launchd, the relay has no Terminal to borrow these from: allow `/usr/bin/osascript` (and
+python3) under Accessibility yourself, then `./launchd/install.sh --restart`. A relay that was
+refused keeps getting "osascript is not allowed assistive access (-1719)" until it restarts, even
+after you allow it.
+
 ## A tour of the API
 
 All responses are JSON. Collections look like this:
