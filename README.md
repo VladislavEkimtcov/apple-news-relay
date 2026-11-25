@@ -177,7 +177,8 @@ the way a publisher shows a lede before its paywall.
 ./launchd/install.sh --undo
 ```
 
-Stop a relay you started in a terminal first: both want port 8787.
+If another relay already has the port (one started in a terminal, say), this one doesn't crash
+or restart over and over: it logs who has the port, waits, and takes over when that one stops.
 
 macOS asks once, the first time, for the permissions above for `python3`. Logs go to
 `~/Library/Logs/apple-news-relay.log`; the archive lives in

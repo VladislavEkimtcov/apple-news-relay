@@ -9,12 +9,15 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import logging
 import os
 import signal
+import socket
 import subprocess
 import sys
+import time
 
 from . import __version__
 from .actuator import JobRunner, NewsApp
@@ -39,8 +42,58 @@ def build(args) -> RelayApp:
                     allow=allow, handoff=handoff)
 
 
+def port_holder(port: int) -> str:
+    """Who listens on the port, as "pid 123 (Python)", for the log; "another program" if lsof can't tell."""
+    try:
+        out = subprocess.run(["lsof", "-nP", "-iTCP:%d" % port, "-sTCP:LISTEN", "-Fpc"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return "another program"
+    pid = next((l[1:] for l in out.splitlines() if l.startswith("p")), None)
+    cmd = next((l[1:] for l in out.splitlines() if l.startswith("c")), None)
+    return "pid %s (%s)" % (pid, cmd) if pid else "another program"
+
+
+def answering(port: int) -> bool:
+    """Whether something already listens on the port here. Binding alone can't tell: with
+    SO_REUSEADDR (HTTPServer sets it) macOS lets 127.0.0.1:8787 bind beside a relay on 0.0.0.0:8787."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def bind_when_free(app, host: str, port: int, wait: float = 5.0, sleep=time.sleep, holder=port_holder,
+                   note_every: float = 600.0, taken=answering):
+    """The server, once the port is free. A relay already serving (say one started in a terminal)
+    keeps it: this one waits quietly, says so in the log now and every ten minutes, and takes over
+    when that one stops, so launchd's KeepAlive never sees a crash to restart."""
+    log = logging.getLogger("apple_news_relay")
+    noted = None
+    while True:
+        try:
+            if not taken(port):
+                return serve(app, host, port)
+        except OSError as e:
+            if e.errno != errno.EADDRINUSE:
+                raise
+        now = time.monotonic()
+        if noted is None or now - noted >= note_every:
+            log.warning("port %d is taken by %s; waiting for it to stop, then serving", port, holder(port))
+            noted = now
+        sleep(wait)
+
+
 def cmd_serve(args) -> int:
     app = build(args)
+    # SIGTERM (launchctl, kill) stops it cleanly, also while it waits for the port.
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    # Bind before harvesting or running jobs: a second relay must not drive News while it waits.
+    try:
+        server = bind_when_free(app, args.host, args.port)
+    except KeyboardInterrupt:
+        return 0
     app.harvester.run_once(force=True)
     app.harvester.start(args.interval)
     app.jobs.start()
@@ -49,7 +102,6 @@ def cmd_serve(args) -> int:
     keep_awake = None
     if args.keep_awake:
         keep_awake = subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])
-    server = serve(app, args.host, args.port)
     bonjour = None
     if args.host not in ("127.0.0.1", "localhost", "::1") and not args.no_bonjour:
         # Lets clients on the LAN find the relay without configuration (_newsrelay._tcp).
@@ -59,7 +111,6 @@ def cmd_serve(args) -> int:
         except OSError:
             bonjour = None
     logging.getLogger("apple_news_relay").info("listening on http://%s:%d", args.host, args.port)
-    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
